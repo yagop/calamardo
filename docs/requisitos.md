@@ -228,14 +228,15 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - Capas 0–19: nvfp4. Pesos E2M1 empaquetados en `u8` (`[128, 2304, 1152]` para `w13`), escala E4M3 por bloque de 16 y escala externa por experto (`*_amax` / `*_outer_scale_denominator`).
 - Capas 20–23: mxfp8. Pesos E4M3, escala UE8M0 por bloque de 32 (`weight_block_shape` 32×32).
 - Los bytes valen tal cual para MLX: el `u8` empaquetado se reinterpreta como `u32` sin reconvertir.
-- `hf_quant_config.json` declara `required_activation_quantization` en los expertos: activaciones nvfp4 por token (bloque 16, regla `fouroversix_mae`) en las capas 0–19 y mxfp8 en las 20–23. El modelo se entrenó así. Hay que decidir si el runtime lo reproduce: afecta a la exactitud frente a la referencia y a K-7.
+- `hf_quant_config.json` declara `required_activation_quantization` en los expertos: activaciones nvfp4 por token (bloque 16, regla `fouroversix_mae`) en las capas 0–19 y mxfp8 en las 20–23. El modelo se entrenó así (W4A4).
+- **Decidido: W4A16.** Las activaciones de los expertos no se cuantizan; entran en bf16 a `gather_qmm`, como en el port de MLX y en Ollama. El M4 Max no tiene aritmética fp4/fp8, así que cuantizarlas no acelera nada y añade trabajo. La referencia para la exactitud del modelo (verificación 2) es una implementación MLX W4A16; contra vLLM o SGLang (W4A4) se esperan pequeñas diferencias. Si se sospecha de la calidad, se puede añadir un modo que simule A4 y medirlo.
 - Las consultas de la mezcla de residuales (`attn_res.*_queries`) se calculan en f32, y los logits de `unembed` salen en f32.
 
 **MLX y la compilación**
 
 - `mlx-rs` incluye `fast::MetalKernel` (con `ensure_row_contiguous`), `compile`, `quantize`/`dequantize`/`quantized_matmul`/`gather_qmm` con nvfp4 y mxfp8, `memory::peak_memory` y `set_wired_limit`. Falta `depends`, que sí está en MLX-C (`mlx_depends`).
 - `mlx-sys` compila MLX desde el código fuente con CMake. Incluso con `MLX_METAL_JIT`, MLX 0.32.2 precompila 9 kernels con `xcrun metal` (arg_reduce, conv, dot, layer_norm, random, rms_norm, rope, sdpa, fence). Sin Xcode, eso no compila.
-- Decidido: no se compila MLX. `scripts/fetch-mlx.sh` descarga la rueda oficial `mlx-metal==0.32.2` de PyPI (sha256 fijado) y deja `libmlx.dylib`, `mlx.metallib` y las cabeceras en `third_party/mlx`. `crates/mlx-sys` sustituye al `mlx-sys` de crates.io (`[patch.crates-io]`): compila solo MLX-C con `cc` y genera los bindings con bindgen, así que `mlx-rs` funciona encima sin cambios. Sin CMake, sin compilador Metal y sin Xcode.
+- Decidido: no se compila MLX. `scripts/fetch-mlx.sh` descarga la rueda oficial `mlx-metal==0.32.4` de PyPI (sha256 fijado) y deja `libmlx.dylib`, `mlx.metallib` y las cabeceras en `third_party/mlx`. Hace falta 0.32.4 (con MLX-C 0.8.0) porque `gather_qmm` recibe ahí la escala global de nvfp4; MLX-C 0.8.0 cambió esa firma y `crates/mlx-sys/vendor/compat` mantiene la de 0.7.0 para `mlx-rs` 0.34. `crates/mlx-sys` sustituye al `mlx-sys` de crates.io (`[patch.crates-io]`): compila solo MLX-C con `cc` y genera los bindings con bindgen, así que `mlx-rs` funciona encima sin cambios. Sin CMake, sin compilador Metal y sin Xcode.
 - Verificado en la GPU (`crates/calamardo/tests/mlx_smoke.rs`): kernel Metal compilado en tiempo de ejecución, `quantized_matmul` nvfp4 y mxfp8 frente a la ruta descomprimida, `mlx_depends` por FFI y `peak_memory`.
 - K-5 se refiere a los kernels propios; el metallib de MLX viene precompilado con la librería.
 

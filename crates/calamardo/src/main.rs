@@ -35,6 +35,26 @@ enum Cmd {
         #[arg(long, env = "CALAMARDO_KV_BITS", default_value_t = 8)]
         kv_bits: usize,
     },
+    /// Greedy generation with a bf16 cache (milestone 1 check).
+    Generate {
+        /// User message, wrapped in the chat format.
+        #[arg(long, conflicts_with_all = ["raw", "tokens"])]
+        prompt: Option<String>,
+        /// Text tokenized as is, without the chat format.
+        #[arg(long, conflicts_with = "tokens")]
+        raw: Option<String>,
+        /// Comma-separated token ids.
+        #[arg(long, value_delimiter = ',')]
+        tokens: Option<Vec<u32>>,
+        /// Reasoning effort for --prompt: none, minimal, low, medium, high.
+        #[arg(long, default_value = "none")]
+        reasoning_effort: String,
+        #[arg(long, default_value_t = 256)]
+        max_tokens: usize,
+        /// Print the token ids instead of the text.
+        #[arg(long)]
+        ids: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,7 +65,137 @@ fn main() -> Result<()> {
     };
     match cli.cmd {
         Cmd::Inspect { kv_bits } => inspect(&Checkpoint::open(&dir)?, kv_bits),
+        Cmd::Generate {
+            prompt,
+            raw,
+            tokens,
+            reasoning_effort,
+            max_tokens,
+            ids,
+        } => {
+            let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+                .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
+            let text = match (prompt, raw) {
+                (Some(p), _) => Some(chat_prompt(&p, &reasoning_effort)?),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            };
+            let prompt_ids = match (text, tokens) {
+                (Some(t), _) => tokenizer
+                    .encode(t, false)
+                    .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+                    .get_ids()
+                    .to_vec(),
+                (None, Some(t)) => t,
+                (None, None) => anyhow::bail!("pass --prompt, --raw or --tokens"),
+            };
+            generate(&dir, &tokenizer, &prompt_ids, max_tokens, ids)
+        }
     }
+}
+
+/// Turns a token stream into text without splitting multi-token characters:
+/// byte-level BPE can spread one UTF-8 character over several tokens.
+#[derive(Default)]
+struct StreamDecoder {
+    ids: Vec<u32>,
+    /// Start of the tokens decoded together for context.
+    prefix: usize,
+    /// End of the tokens whose text was already printed.
+    read: usize,
+}
+
+impl StreamDecoder {
+    /// Returns the new text once it is complete.
+    fn push(&mut self, tokenizer: &tokenizers::Tokenizer, id: u32) -> Option<String> {
+        self.ids.push(id);
+        let printed = tokenizer
+            .decode(&self.ids[self.prefix..self.read], false)
+            .ok()?;
+        let current = tokenizer.decode(&self.ids[self.prefix..], false).ok()?;
+        if current.len() > printed.len() && !current.ends_with('\u{FFFD}') {
+            let new = current[printed.len()..].to_string();
+            self.prefix = self.read;
+            self.read = self.ids.len();
+            Some(new)
+        } else {
+            None
+        }
+    }
+}
+
+/// A single user message in the chat format of the checkpoint's template.
+/// Temporary until the template is rendered for real (M-9).
+fn chat_prompt(message: &str, effort: &str) -> Result<String> {
+    let level = match effort {
+        "none" => "0",
+        "minimal" => "0.1",
+        "low" => "0.2",
+        "medium" => "0.7",
+        "high" => "0.9",
+        "xhigh" | "max" => "0.99",
+        other => anyhow::bail!("unknown reasoning effort: {other}"),
+    };
+    Ok(format!(
+        "<|message_system|><|content_text|>Thinking effort level: {level}<|end_message|>\
+         <|message_user|><|content_text|>{message}<|end_message|>"
+    ))
+}
+
+fn generate(
+    dir: &std::path::Path,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &[u32],
+    max_tokens: usize,
+    ids: bool,
+) -> Result<()> {
+    use std::io::Write;
+    use std::time::Instant;
+
+    let t = Instant::now();
+    let model = calamardo_model::Model::load(dir)?;
+    let eos = model.config.eos_token_id;
+    eprintln!(
+        "loaded in {:.1}s · {:.2} GB active",
+        t.elapsed().as_secs_f64(),
+        mlx_rs::memory::active_memory()? as f64 / 1e9
+    );
+    eprintln!("prompt: {} tokens", prompt.len());
+
+    mlx_rs::memory::reset_peak_memory()?;
+    let t = Instant::now();
+    let mut first: Option<f64> = None;
+    let mut out = std::io::stdout();
+    let mut text = StreamDecoder::default();
+    let tokens = calamardo_model::generate::greedy(
+        &model,
+        prompt,
+        max_tokens,
+        calamardo_model::generate::PREFILL_STEP,
+        |tok| {
+            first.get_or_insert(t.elapsed().as_secs_f64());
+            if ids {
+                print!("{tok} ");
+            } else if let Some(s) = text.push(tokenizer, tok) {
+                print!("{s}");
+            }
+            let _ = out.flush();
+            tok != eos
+        },
+    )?;
+    println!();
+    let total = t.elapsed().as_secs_f64();
+    let first = first.unwrap_or(total);
+    let decode = (tokens.len().saturating_sub(1)) as f64 / (total - first).max(1e-9);
+    eprintln!(
+        "prefill {:.0} tok/s ({:.2}s) · decode {:.1} tok/s · {} tokens · peak {:.2} GB",
+        prompt.len() as f64 / first,
+        first,
+        decode,
+        tokens.len(),
+        mlx_rs::memory::peak_memory()? as f64 / 1e9
+    );
+    Ok(())
 }
 
 fn gb(b: u64) -> f64 {

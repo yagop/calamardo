@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/calamardo", "crates/calamardo-ckpt", "crates/mlx-sys"]
+members = ["crates/calamardo", "crates/calamardo-ckpt", "crates/calamardo-model", "crates/mlx-sys"]
 
 [workspace.package]
 edition = "2024"
@@ -12,7 +12,9 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 calamardo-ckpt = { path = "crates/calamardo-ckpt" }
+calamardo-model = { path = "crates/calamardo-model" }
 mlx-rs = { version = "=0.34.0", default-features = false, features = ["metal", "accelerate"] }
 mlx-sys = { version = "=0.7.0", default-features = false }
 

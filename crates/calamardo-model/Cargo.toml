@@ -1,0 +1,13 @@
+[package]
+name = "calamardo-model"
+description = "Inkling 2 Mini forward pass on MLX"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+calamardo-ckpt.workspace = true
+mlx-rs.workspace = true
+mlx-sys.workspace = true

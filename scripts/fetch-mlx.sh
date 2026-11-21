@@ -6,10 +6,10 @@
 # The MLX version must match the MLX-C revision vendored in crates/mlx-sys.
 set -eu
 
-VERSION=0.32.2
+VERSION=0.32.4
 WHEEL=mlx_metal-${VERSION}-py3-none-macosx_26_0_arm64.whl
-URL=https://files.pythonhosted.org/packages/dd/cd/4e50bf325100e7165e13d025f264362bf0009196269f9eaf87f2c6e738a2/${WHEEL}
-SHA256=e6abeac9ac5265830c9c1541b6f96e9be37a85c2446763a46ad466c63a3837ab
+URL=https://files.pythonhosted.org/packages/2a/d6/4340ed6e184f71693d7f531c9ae55d677451351245760d71f8dd714dcbe5/${WHEEL}
+SHA256=514df92d41a286895d2564b4b18f4da45096bd7a4a0c47e1042f345ad5a7f936
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEST=${CALAMARDO_MLX_DIR:-$ROOT/third_party/mlx}
