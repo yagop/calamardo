@@ -55,6 +55,9 @@ enum Cmd {
         /// Text tokenized as is, without the chat format.
         #[arg(long, conflicts_with = "tokens")]
         raw: Option<String>,
+        /// File whose text is tokenized as is, like --raw.
+        #[arg(long, conflicts_with_all = ["raw", "tokens", "prompt"])]
+        raw_file: Option<PathBuf>,
         /// Comma-separated token ids.
         #[arg(long, value_delimiter = ',')]
         tokens: Option<Vec<u32>>,
@@ -72,6 +75,12 @@ enum Cmd {
         /// Channels per scale/bias group of the quantized KV cache.
         #[arg(long, env = "CALAMARDO_KV_GROUP", default_value_t = 64)]
         kv_group: i32,
+        /// Prompt tokens per prefill chunk.
+        #[arg(long, default_value_t = calamardo_model::generate::PREFILL_STEP)]
+        prefill_step: usize,
+        /// Log time and memory of each prefill chunk.
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -107,17 +116,23 @@ fn main() -> Result<()> {
         }
         Cmd::Generate {
             prompt,
-            raw,
+            mut raw,
+            raw_file,
             tokens,
             reasoning_effort,
             max_tokens,
             ids,
             kv_bits,
             kv_group,
+            prefill_step,
+            verbose,
         } => {
             let kv = calamardo_model::cache::KvFormat::new(kv_bits, kv_group)?;
             let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
                 .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
+            if let Some(f) = raw_file {
+                raw = Some(std::fs::read_to_string(f)?);
+            }
             let text = match (prompt, raw) {
                 (Some(p), _) => Some(chat_prompt(&p, &reasoning_effort)?),
                 (None, Some(r)) => Some(r),
@@ -132,7 +147,16 @@ fn main() -> Result<()> {
                 (None, Some(t)) => t,
                 (None, None) => anyhow::bail!("pass --prompt, --raw or --tokens"),
             };
-            generate(&dir, &tokenizer, &prompt_ids, max_tokens, ids, kv)
+            generate(
+                &dir,
+                &tokenizer,
+                &prompt_ids,
+                max_tokens,
+                ids,
+                kv,
+                prefill_step,
+                verbose,
+            )
         }
     }
 }
@@ -185,6 +209,7 @@ fn chat_prompt(message: &str, effort: &str) -> Result<String> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate(
     dir: &std::path::Path,
     tokenizer: &tokenizers::Tokenizer,
@@ -192,6 +217,8 @@ fn generate(
     max_tokens: usize,
     ids: bool,
     kv: calamardo_model::cache::KvFormat,
+    prefill_step: usize,
+    verbose: bool,
 ) -> Result<()> {
     use std::io::Write;
     use std::time::Instant;
@@ -219,8 +246,23 @@ fn generate(
         &model,
         prompt,
         max_tokens,
-        calamardo_model::generate::PREFILL_STEP,
+        prefill_step,
         kv,
+        |c| {
+            if verbose {
+                eprintln!(
+                    "prefill {:>7}/{} · {:>4} tokens in {:.2}s · {:.0} tok/s · active {:.2} GB · peak {:.2} GB (+{:.2})",
+                    c.done,
+                    c.total,
+                    c.tokens,
+                    c.seconds,
+                    c.tokens as f64 / c.seconds,
+                    c.active_bytes as f64 / 1e9,
+                    c.peak_bytes as f64 / 1e9,
+                    (c.peak_bytes as f64 - c.active_bytes as f64) / 1e9
+                );
+            }
+        },
         |tok| {
             first.get_or_insert(t.elapsed().as_secs_f64());
             if ids {
@@ -264,6 +306,7 @@ fn kv_eval(
         n,
         generate::PREFILL_STEP,
         KvFormat::BF16,
+        |_| {},
         |_| true,
     )?;
     let mut reference = Vec::with_capacity(tokens.len());

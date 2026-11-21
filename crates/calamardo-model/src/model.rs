@@ -958,6 +958,9 @@ fn depth_attention(
 
 pub struct Model {
     pub config: ModelConfig,
+    /// Calls with at least this many tokens evaluate pass by pass (bounded
+    /// prefill); `i32::MAX` builds the whole forward as one graph.
+    pub bounded_prefill_from: i32,
     kernels: Kernels,
     embed: Array,
     embed_norm: Array,
@@ -1034,6 +1037,7 @@ impl Model {
         }
         Ok(Self {
             config,
+            bounded_prefill_from: MAX_DECODE_QUERIES + 1,
             kernels,
             embed,
             embed_norm,
@@ -1075,6 +1079,7 @@ impl Model {
     pub fn forward(&self, tokens: &Array, cache: &mut [PassCache]) -> Result<Array> {
         let cfg = self.text();
         let k = &self.kernels;
+        let bounded = tokens.shape()[1] >= self.bounded_prefill_from;
         let h = ops::take(&self.embed, tokens, 0)?;
         let h = ops::rms_norm(&h, Some(&self.embed_norm), cfg.rms_norm_eps)?;
         let dtype = h.dtype();
@@ -1100,6 +1105,14 @@ impl Model {
                 let c = caches.next().context("not enough caches")?;
                 let (nh, nbs) = layer.forward(k, &h, bs.as_ref(), c, messages.as_ref())?;
                 debug_assert!(layer.index < cfg.num_hidden_layers);
+                if bounded {
+                    // Bounded prefill (K-1, K-3): finish this pass before the
+                    // next one starts, so only one pass's intermediates, and
+                    // at most one dequantized history, are alive.
+                    let mut live = vec![&nh, &nbs];
+                    live.extend(c.arrays());
+                    ops::eval(&live)?;
+                }
                 h = nh;
                 bs = Some(nbs);
             }

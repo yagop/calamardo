@@ -252,9 +252,21 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - Calidad (verificación 2), 8.042 tokens de prompt y 256 generados forzando los tokens de bf16 (`calamardo kv-eval`): KL media 0,0044 (8 bits) y 0,0076 (4 bits/64, igual con grupo 32); el top-1 coincide en 251 y 248 de 256 tokens. La aguja aparece con los tres formatos a 8k y 31k. Falta medir a 100k y 160k, después del Hito 3 (hoy el pico de memoria del prefill lo impide).
 - Rendimiento con 31k de contexto: prefill a 784 tok/s y decode a 32 tok/s sin drafter en los tres formatos.
 
+**Hito 3: prefill acotado (estado)**
+
+- Causa del pico: el forward de un trozo de 2.048 tokens se construía como un solo grafo de 48 pasadas y MLX mantenía vivos los intermedios de muchas a la vez: unos +4 GB por trozo, constantes con el contexto. En esta implementación la tabla de bias es L × 24 × 1.024 (unos 100 MB por pasada con L = 2.048) y no crece con el contexto, así que el problema de Ollama que describe K-1 no aparece aquí.
+- K-1 y K-3: con más de 8 tokens, el forward evalúa al final de cada pasada su salida, sus estados de bloque y su caché, antes de construir la siguiente (`Model::bounded_prefill_from`). Solo están vivos los intermedios de una pasada, y como mucho un historial descomprimido. Es una barrera de evaluación en vez de `mlx_depends`; mismo efecto y los valores no cambian (paridad con la referencia intacta). El pico de un trozo de 2.048 baja de +4,0 a +1,6 GB sin perder velocidad; con trozos de 4.096, +2,2 GB y un 5 % más rápido.
+- K-9 (parcial): cada trozo de prefill informa de tokens, tiempo, memoria activa y pico (`calamardo generate -v`). Falta exponerlo en `/metrics` (Hito 4).
+- Medido con un prompt de 166.561 tokens y caché de 8 bits:
+  - Prefill en frío: 5,3 min (objetivo ≤ 7; Ollama ~15).
+  - Prefill a ~145k de contexto: 401 tok/s (objetivo ≥ 200; Ollama ~90). Va de 816 tok/s al principio a 378 al final.
+  - Pico transitorio por encima de lo activo: 2,13 GB como máximo (objetivo ≤ 3; Ollama 9–10). Pico total, 24,4 GB.
+  - Decode a 166k: 26,6 tok/s sin drafter. Encuentra la aguja.
+- Calidad a 166k (`kv-eval`, 128 tokens forzados desde bf16): KL media 0,0026 con 8 bits (126/128 en top-1) y 0,0102 con 4 bits (125/128). A 8k eran 0,0044 y 0,0076: 8 bits no empeora con el contexto y 4 bits sí, alrededor de 4 veces la divergencia de 8 bits a 160k. Responde la pregunta abierta: 4 bits funciona, pero la recomendación sigue siendo 8 bits y 4 bits queda como opción para contextos que no caben de otra forma.
+
 **Incoherencias a resolver**
 
-1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k.
+1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k. Resuelto en la práctica: Calamardo hace 401 tok/s a 145k y 5,3 min en frío.
 2. C-1 con instantáneas completas cada 8.192 tokens acumula unos 30–40 GB por conversación de 160k. La caché global solo crece por el final: los bloques sellados deben compartirse entre instantáneas, y solo copiarse las ventanas (unos 168 MB). Matiza el requisito 6 de la caché KV.
 3. El puerto por defecto 11434 choca con Ollama durante las comparativas (verificación 6).
 4. Restaurar 160k desde disco: unos 3,6 GB a 8 bits con drafter y ventanas. Cabe en 2 s solo con lectura directa (mmap) a los buffers.

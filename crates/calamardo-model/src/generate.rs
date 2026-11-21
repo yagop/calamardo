@@ -32,21 +32,48 @@ fn step(model: &Model, tokens: &Array, cache: &mut [PassCache]) -> Result<Array>
     ops::argmax(&step_logprobs(model, tokens, cache)?, -1)
 }
 
+/// One prefill chunk, reported as it finishes (K-9, API requirement 6).
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillChunk {
+    /// Prompt tokens processed so far, out of `total`.
+    pub done: usize,
+    pub total: usize,
+    /// Tokens in this chunk.
+    pub tokens: usize,
+    pub seconds: f64,
+    /// MLX memory in use after the chunk (weights and caches).
+    pub active_bytes: usize,
+    /// Highest MLX memory in use during the chunk.
+    pub peak_bytes: usize,
+}
+
 /// Prefills all of `prompt` but its last token, as `greedy` does.
 fn prefill(
     model: &Model,
     prompt: &[i32],
     prefill_step: usize,
     cache: &mut [PassCache],
+    on_chunk: &mut dyn FnMut(PrefillChunk),
 ) -> Result<usize> {
     let mut done = 0;
     while prompt.len() - done > 1 {
         let n = prefill_step.min(prompt.len() - done - 1);
+        let t = std::time::Instant::now();
+        mlx_rs::memory::reset_peak_memory()?;
         let chunk = Array::from_slice(&prompt[done..done + n], &[n as i32]);
         model.forward(&ops::reshape(&chunk, &[1, n as i32])?, cache)?;
         eval_cache(cache)?;
+        let peak_bytes = mlx_rs::memory::peak_memory()?;
         done += n;
         ops::clear_cache();
+        on_chunk(PrefillChunk {
+            done,
+            total: prompt.len(),
+            tokens: n,
+            seconds: t.elapsed().as_secs_f64(),
+            active_bytes: mlx_rs::memory::active_memory()?,
+            peak_bytes,
+        });
     }
     Ok(done)
 }
@@ -65,7 +92,7 @@ pub fn teacher_forced(
     anyhow::ensure!(!prompt.is_empty(), "empty prompt");
     let mut cache = model.make_cache(kv);
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let done = prefill(model, &prompt, prefill_step, &mut cache)?;
+    let done = prefill(model, &prompt, prefill_step, &mut cache, &mut |_| {})?;
     let last = &prompt[done..];
     let mut input = Array::from_slice(last, &[last.len() as i32]);
     for (i, &tok) in forced.iter().enumerate() {
@@ -88,12 +115,19 @@ pub fn greedy(
     max_tokens: usize,
     prefill_step: usize,
     kv: KvFormat,
+    mut on_prefill: impl FnMut(PrefillChunk),
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<Vec<u32>> {
     anyhow::ensure!(!prompt.is_empty(), "empty prompt");
     let mut cache = model.make_cache(kv);
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let done = prefill(model, &prompt_i32, prefill_step, &mut cache)?;
+    let done = prefill(
+        model,
+        &prompt_i32,
+        prefill_step,
+        &mut cache,
+        &mut on_prefill,
+    )?;
 
     let last = &prompt_i32[done..];
     let mut y = step(
