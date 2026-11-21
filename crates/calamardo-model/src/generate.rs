@@ -5,8 +5,11 @@
 use anyhow::Result;
 use mlx_rs::{Array, Dtype};
 
+use anyhow::Context;
+
 use crate::{
     cache::{KvFormat, PassCache},
+    draft::{DraftSnapshot, DraftState, Drafter},
     model::Model,
     ops,
 };
@@ -174,12 +177,39 @@ pub struct Snapshot {
     pub len: usize,
     /// Taken just before a prompt's last token (vs. periodic).
     pub prompt_end: bool,
+    /// Reached only through full prefill chunks from the start, as a cold run
+    /// would: resuming here is bit-exact (C-2, aligned mode).
+    pub aligned: bool,
     passes: Vec<crate::cache::PassSnapshot>,
+    draft: Option<DraftSnapshot>,
 }
 
 impl Snapshot {
     pub fn nbytes(&self) -> usize {
-        self.passes.iter().map(|p| p.nbytes()).sum()
+        self.passes.iter().map(|p| p.nbytes()).sum::<usize>()
+            + self.draft.as_ref().map_or(0, |d| d.nbytes())
+    }
+
+    fn arrays(&self) -> Vec<Array> {
+        let mut out: Vec<Array> = self
+            .passes
+            .iter()
+            .flat_map(|p| match p {
+                crate::cache::PassSnapshot::Global { conv, .. } => {
+                    conv.iter().flatten().cloned().collect::<Vec<_>>()
+                }
+                crate::cache::PassSnapshot::Window { cache, conv } => cache
+                    .arrays()
+                    .into_iter()
+                    .cloned()
+                    .chain(conv.iter().flatten().cloned())
+                    .collect(),
+            })
+            .collect();
+        if let Some(d) = &self.draft {
+            out.extend(d.arrays());
+        }
+        out
     }
 }
 
@@ -201,29 +231,60 @@ impl Reuse {
     }
 }
 
+/// One speculative round's outcome.
+pub struct Speculated {
+    /// Accepted drafts followed by the target's own next token (the new
+    /// last token, not yet fed).
+    pub tokens: Vec<u32>,
+    pub drafted: usize,
+    pub accepted: usize,
+}
+
 /// A conversation's caches plus the tokens they hold. `feed` follows the
 /// same schedule as `greedy`, so feeding a prompt and then one token at a
 /// time reproduces it.
 #[derive(Clone)]
 pub struct Session<'m> {
     model: &'m Model,
+    drafter: Option<&'m Drafter>,
     cache: Vec<PassCache>,
+    draft: Option<DraftState>,
     /// Every token fed so far, in order.
     pub tokens: Vec<u32>,
     pub prefill_step: usize,
     /// Earlier points of `tokens`, by increasing length.
     pub snapshots: Vec<Snapshot>,
+    /// Everything so far came in full prefill chunks from the start.
+    pure: bool,
+    /// The saved file this session was loaded from, if any.
+    pub origin: Option<std::path::PathBuf>,
 }
 
 impl<'m> Session<'m> {
     pub fn new(model: &'m Model, kv: KvFormat) -> Self {
         Self {
             model,
+            drafter: None,
             cache: model.make_cache(kv),
+            draft: None,
             tokens: Vec::new(),
             prefill_step: PREFILL_STEP,
             snapshots: Vec::new(),
+            pure: true,
+            origin: None,
         }
+    }
+
+    /// Enables speculative decoding with `drafter`, which then follows every
+    /// token fed (on a fresh session).
+    pub fn with_drafter(mut self, drafter: &'m Drafter) -> Self {
+        self.draft = Some(drafter.new_state());
+        self.drafter = Some(drafter);
+        self
+    }
+
+    pub fn has_drafter(&self) -> bool {
+        self.drafter.is_some()
     }
 
     fn take_snapshot(&mut self, prompt_end: bool) {
@@ -236,15 +297,18 @@ impl<'m> Session<'m> {
         self.snapshots.push(Snapshot {
             len: self.tokens.len(),
             prompt_end,
+            aligned: self.pure,
             passes: self.cache.iter().map(|c| c.snapshot()).collect(),
+            draft: self.draft.as_ref().map(|d| d.snapshot()),
         });
     }
 
     /// The longest start for `prompt`: the live end if the prompt extends
     /// it, else the longest snapshot inside the common prefix. At least one
-    /// prompt token is always left to feed. With `aligned`, only points at
-    /// multiples of `prefill_step` qualify, so the chunks match a cold run
-    /// and the output is bit for bit the same (C-2).
+    /// prompt token is always left to feed. With `aligned`, only snapshots
+    /// reached through full prefill chunks qualify (never the live end), so
+    /// the chunks match a cold run and the output is bit for bit the same
+    /// (C-2).
     pub fn reuse(&self, prompt: &[u32], aligned: bool) -> Option<Reuse> {
         let common = self
             .tokens
@@ -252,17 +316,15 @@ impl<'m> Session<'m> {
             .zip(prompt)
             .take_while(|(a, b)| a == b)
             .count();
-        let ok = |len: usize| {
-            len > 0 && len < prompt.len() && (!aligned || len.is_multiple_of(self.prefill_step))
-        };
-        let live =
-            (common == self.tokens.len() && ok(common)).then_some(Reuse::Live { len: common });
+        let ok = |len: usize| len > 0 && len < prompt.len();
+        let live = (!aligned && common == self.tokens.len() && ok(common))
+            .then_some(Reuse::Live { len: common });
         let snap = self
             .snapshots
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, s)| s.len <= common && ok(s.len))
+            .find(|(_, s)| s.len <= common && ok(s.len) && (!aligned || s.aligned))
             .map(|(index, s)| Reuse::Snapshot { index, len: s.len });
         match (live, snap) {
             (Some(l), Some(s)) if s.tokens() > l.tokens() => Some(s),
@@ -277,22 +339,53 @@ impl<'m> Session<'m> {
         for (c, p) in self.cache.iter_mut().zip(&snap.passes) {
             c.restore(p);
         }
+        if let (Some(d), Some(sd)) = (self.draft.as_mut(), snap.draft.as_ref()) {
+            d.restore(sd);
+        }
         self.tokens.truncate(snap.len);
         self.snapshots.truncate(index + 1);
+        self.pure = snap.aligned;
+    }
+
+    /// Returns to the latest snapshot, if any (after a failed request: the
+    /// caches may hold half of a chunk).
+    pub fn recover(&mut self) -> bool {
+        match self.snapshots.len() {
+            0 => false,
+            n => {
+                self.restore(n - 1);
+                true
+            }
+        }
+    }
+
+    /// Whether anything after snapshot `index` is worth keeping apart: a
+    /// later prompt (a new user turn), not just a generated answer.
+    pub fn branches_after(&self, index: usize) -> bool {
+        self.snapshots[index + 1..].iter().any(|s| s.prompt_end)
     }
 
     /// A new session at snapshot `index`; this one is left as it is. The
-    /// caches are shared until one side writes, when MLX copies them.
-    pub fn fork(&self, index: usize) -> Session<'m> {
+    /// caches are shared until one side writes; their capacity is cut to the
+    /// prefix so that write copies only the prefix.
+    pub fn fork(&self, index: usize) -> Result<Session<'m>> {
         let mut s = self.clone();
         s.restore(index);
-        s
+        for c in &mut s.cache {
+            c.shrink()?;
+        }
+        if let Some(d) = s.draft.as_mut() {
+            d.shrink()?;
+        }
+        s.origin = None;
+        Ok(s)
     }
 
     /// Memory held by the caches and the snapshots (an upper bound when
     /// arrays are shared).
     pub fn nbytes(&self) -> usize {
         self.cache.iter().map(|c| c.nbytes()).sum::<usize>()
+            + self.draft.as_ref().map_or(0, |d| d.nbytes())
             + self.snapshots.iter().map(|s| s.nbytes()).sum::<usize>()
     }
 
@@ -314,6 +407,33 @@ impl<'m> Session<'m> {
         }
     }
 
+    fn capture_ids(&self) -> &[usize] {
+        self.drafter.map_or(&[], |d| d.target_layer_ids.as_slice())
+    }
+
+    /// Runs the target on `tokens` (1, L), keeping the drafter's context in
+    /// step with the accepted positions.
+    fn forward(&mut self, tokens: &Array, keep_windows: bool) -> Result<(Array, Option<Array>)> {
+        let ids = self.capture_ids().to_vec();
+        self.model
+            .forward_ex(tokens, &mut self.cache, &ids, keep_windows)
+    }
+
+    fn add_context(&mut self, hidden: Option<&Array>) -> Result<()> {
+        if let (Some(d), Some(state), Some(h)) = (self.drafter, self.draft.as_mut(), hidden) {
+            d.add_context(state, h)?;
+        }
+        Ok(())
+    }
+
+    fn eval_state(&self) -> Result<()> {
+        let mut arrays: Vec<&Array> = self.cache.iter().flat_map(|c| c.arrays()).collect();
+        if let Some(d) = &self.draft {
+            arrays.extend(d.arrays());
+        }
+        ops::eval(&arrays)
+    }
+
     /// Feeds `tokens` and returns the log-probabilities (1, V) of the next
     /// one. All but the last token go through the chunked prefill; the
     /// last through a single-token step. Checks `cancel` between chunks.
@@ -325,6 +445,7 @@ impl<'m> Session<'m> {
     ) -> Result<Array> {
         use std::sync::atomic::Ordering;
         anyhow::ensure!(!tokens.is_empty(), "nothing to feed");
+        anyhow::ensure!(self.prefill_step > 0, "prefill step must be positive");
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let mut done = 0;
         while ids.len() - done > 1 {
@@ -335,11 +456,13 @@ impl<'m> Session<'m> {
             let t = std::time::Instant::now();
             mlx_rs::memory::reset_peak_memory()?;
             let chunk = Array::from_slice(&ids[done..done + n], &[1, n as i32]);
-            self.model.forward(&chunk, &mut self.cache)?;
-            eval_cache(&self.cache)?;
+            let (_, hidden) = self.forward(&chunk, false)?;
+            self.add_context(hidden.as_ref())?;
+            self.eval_state()?;
             let peak_bytes = mlx_rs::memory::peak_memory()?;
             let before = self.tokens.len();
             self.tokens.extend_from_slice(&tokens[done..done + n]);
+            self.pure &= n == self.prefill_step;
             done += n;
             if self.tokens.len() / SNAPSHOT_EVERY > before / SNAPSHOT_EVERY {
                 self.take_snapshot(false);
@@ -358,11 +481,163 @@ impl<'m> Session<'m> {
             // End of a prompt: a retry of it only recomputes the last token.
             self.take_snapshot(true);
         }
-        let last = Array::from_slice(&ids[done..], &[(ids.len() - done) as i32]);
-        let lp = step_logprobs(self.model, &last, &mut self.cache)?;
+        let last = Array::from_slice(&ids[done..], &[1, (ids.len() - done) as i32]);
+        let (logits, hidden) = self.forward(&last, false)?;
+        self.add_context(hidden.as_ref())?;
+        let l = logits.shape()[1];
+        let logits = ops::squeeze(&ops::slice(&logits, 1, l - 1, l, 1)?, &[1])?;
+        let lp = ops::sub(&logits, &ops::logsumexp(&logits, &[0, 1], true)?)?;
         self.tokens.extend_from_slice(&tokens[done..]);
+        self.pure = false;
         Ok(lp)
     }
+
+    /// One speculative round (M-7): drafts up to `block - 1` tokens after
+    /// `last` (sampled, not yet fed), verifies them with one target forward
+    /// and keeps the accepted prefix. A stop token among the accepted ends
+    /// the round there, so the session never holds tokens past it.
+    pub fn speculate(
+        &mut self,
+        last: u32,
+        block: usize,
+        sampler: &mut Sampler,
+        stop: &[u32],
+    ) -> Result<Speculated> {
+        let drafter = self.drafter.context("speculation needs a drafter")?;
+        let state = self.draft.as_ref().context("speculation needs a drafter")?;
+        let drafts = drafter.draft(self.model, state, last, block.saturating_sub(1).max(1))?;
+        let mut input: Vec<i32> = vec![last as i32];
+        input.extend(drafts.iter().map(|&t| t as i32));
+        let l = input.len() as i32;
+        let (logits, hidden) = self.forward(&Array::from_slice(&input, &[1, l]), true)?;
+        let logits = ops::squeeze(&logits, &[0])?;
+        let lp = ops::sub(&logits, &ops::logsumexp(&logits, &[-1], true)?)?;
+        let rows = sampler.verify(&lp, &drafts)?;
+        let mut accepted = rows.accepted;
+        let mut next = rows.next;
+        if let Some(j) = drafts[..accepted].iter().position(|t| stop.contains(t)) {
+            accepted = j;
+            next = drafts[j];
+        }
+        let keep = accepted as i32 + 1;
+        for c in &mut self.cache {
+            c.rewind(l, keep)?;
+        }
+        if let Some(h) = &hidden {
+            let h = ops::slice(h, 1, 0, keep, 1)?;
+            self.add_context(Some(&h))?;
+        }
+        self.eval_state()?;
+        self.tokens.push(last);
+        self.tokens.extend_from_slice(&drafts[..accepted]);
+        self.pure = false;
+        let mut tokens = drafts[..accepted].to_vec();
+        tokens.push(next);
+        Ok(Speculated {
+            tokens,
+            drafted: drafts.len(),
+            accepted,
+        })
+    }
+}
+
+/// Picks how many tokens to draft next from recent acceptance (M-7): the
+/// policy mlx-vlm uses for DFlash drafters, within the trained block.
+pub struct DraftPolicy {
+    history: std::collections::VecDeque<(usize, usize)>,
+    ceiling: usize,
+    /// Measured speeds (tokens per second, smoothed) with and without
+    /// drafting: drafting stops when it does not pay (long contexts, where
+    /// verifying a block costs more), probing again now and then.
+    spec_tps: Option<f64>,
+    plain_tps: Option<f64>,
+    decisions: usize,
+}
+
+impl DraftPolicy {
+    /// Shortest block the policy backs off to.
+    const MIN_BLOCK: usize = 4;
+
+    pub fn new(block_size: usize) -> Self {
+        Self {
+            history: Default::default(),
+            ceiling: block_size,
+            spec_tps: None,
+            plain_tps: None,
+            decisions: 0,
+        }
+    }
+
+    /// Every this many decisions the slower mode is tried again.
+    const PROBE_EVERY: usize = 16;
+
+    /// Time of one round (speculative) or one plain step.
+    pub fn record_time(&mut self, tokens: usize, seconds: f64, speculative: bool) {
+        let tps = tokens as f64 / seconds.max(1e-6);
+        let slot = if speculative {
+            &mut self.spec_tps
+        } else {
+            &mut self.plain_tps
+        };
+        *slot = Some(slot.map_or(tps, |old| 0.7 * old + 0.3 * tps));
+    }
+
+    pub fn record(&mut self, accepted: usize, drafted: usize) {
+        self.history.push_back((accepted, drafted));
+        if self.history.len() > 8 {
+            self.history.pop_front();
+        }
+    }
+
+    /// Block size (anchor plus drafts) for the next round, given the tokens
+    /// still allowed. 1 means: decode without drafting.
+    pub fn next(&mut self, remaining: usize) -> usize {
+        let total = self.ceiling.min(remaining + 1);
+        if total <= 1 {
+            return total;
+        }
+        self.decisions += 1;
+        let probe = self.decisions.is_multiple_of(Self::PROBE_EVERY);
+        match (self.spec_tps, self.plain_tps) {
+            // Measure plain decoding once drafting has a few rounds.
+            (Some(_), None) if self.decisions >= 4 => return 1,
+            (Some(s), Some(p)) if s < p && !probe => return 1,
+            _ => {}
+        }
+        let recent: Vec<_> = self.history.iter().filter(|(_, d)| *d > 0).collect();
+        let Some(&&(_, last_drafted)) = recent.last() else {
+            return total;
+        };
+        let current = total.min((last_drafted + 1).max(2));
+        let min_total = total.min(Self::MIN_BLOCK.max(2));
+        let drafted: usize = recent.iter().map(|(_, d)| d).sum();
+        let accepted: usize = recent.iter().map(|(a, _)| a).sum();
+        let rate = accepted as f64 / drafted as f64;
+        let mean = accepted as f64 / recent.len() as f64;
+        if rate < 0.30 || mean < 2.0 {
+            return if current >= 8 {
+                min_total.max(total.min(current / 2))
+            } else {
+                min_total.max(total.min(current.saturating_sub(2)))
+            };
+        }
+        if rate < 0.50 {
+            return min_total.max(total.min(current.saturating_sub(2)));
+        }
+        let full = recent.iter().filter(|(a, d)| a >= d).count() as f64 / recent.len() as f64;
+        if rate >= 0.85 && full >= 0.75 {
+            return total.min(current + 2);
+        }
+        current
+    }
+}
+
+/// Verification of a block of drafts against the target.
+pub struct Verified {
+    /// Leading drafts accepted.
+    pub accepted: usize,
+    /// The target's token after them.
+    pub next: u32,
 }
 
 /// Picks the next token from log-probabilities (1, V).
@@ -391,16 +666,8 @@ impl Sampler {
         (z >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    pub fn sample(&mut self, logprobs: &Array) -> Result<u32> {
-        if self.temperature <= 0.0 {
-            // Greedy on the GPU, exactly as `greedy` does.
-            let y = ops::astype(&ops::argmax(logprobs, -1)?, Dtype::Uint32)?;
-            ops::eval(&[&y])?;
-            return Ok(y.item_exact::<u32>());
-        }
-        let lp = ops::f32(logprobs)?;
-        ops::eval(&[&lp])?;
-        let lp = lp.as_slice::<f32>();
+    /// The sampling distribution (unnormalized) after temperature and top_p.
+    fn probs(&self, lp: &[f32]) -> Vec<(u32, f64)> {
         let t = self.temperature as f64;
         let max = lp.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
         let mut probs: Vec<(u32, f64)> = lp
@@ -425,20 +692,89 @@ impl Sampler {
             }
             probs.truncate(keep);
         }
+        probs
+    }
+
+    fn draw(&mut self, probs: &[(u32, f64)]) -> u32 {
         let total: f64 = probs.iter().map(|p| p.1).sum();
         let mut r = self.next_f64() * total;
-        for &(id, p) in &probs {
+        for &(id, p) in probs {
             r -= p;
             if r <= 0.0 {
-                return Ok(id);
+                return id;
             }
         }
-        Ok(probs.last().map_or(0, |p| p.0))
+        probs.last().map_or(0, |p| p.0)
+    }
+
+    pub fn sample(&mut self, logprobs: &Array) -> Result<u32> {
+        if self.temperature <= 0.0 {
+            // Greedy on the GPU, exactly as `greedy` does.
+            let y = ops::astype(&ops::argmax(logprobs, -1)?, Dtype::Uint32)?;
+            ops::eval(&[&y])?;
+            return Ok(y.item_exact::<u32>());
+        }
+        let lp = ops::f32(logprobs)?;
+        ops::eval(&[&lp])?;
+        let probs = self.probs(lp.as_slice::<f32>());
+        Ok(self.draw(&probs))
+    }
+
+    /// Checks greedy drafts (one per row but the last of `logprobs`, (L, V))
+    /// against the target. Greedy: a draft stays if it is the argmax. With
+    /// temperature: a draft `d` stays with probability p(d) and, if it does
+    /// not, the token comes from p without `d`; this samples exactly from the
+    /// target distribution.
+    pub fn verify(&mut self, logprobs: &Array, drafts: &[u32]) -> Result<Verified> {
+        let rows = logprobs.shape()[0] as usize;
+        anyhow::ensure!(
+            rows == drafts.len() + 1,
+            "{rows} rows for {} drafts",
+            drafts.len()
+        );
+        if self.temperature <= 0.0 {
+            let y = ops::astype(&ops::argmax(logprobs, -1)?, Dtype::Uint32)?;
+            ops::eval(&[&y])?;
+            let target = y.as_slice::<u32>();
+            let accepted = drafts
+                .iter()
+                .zip(target)
+                .take_while(|(d, t)| d == t)
+                .count();
+            return Ok(Verified {
+                accepted,
+                next: target[accepted],
+            });
+        }
+        let lp = ops::f32(logprobs)?;
+        ops::eval(&[&lp])?;
+        let all = lp.as_slice::<f32>();
+        let v = all.len() / rows;
+        for (i, &d) in drafts.iter().enumerate() {
+            let mut probs = self.probs(&all[i * v..(i + 1) * v]);
+            let total: f64 = probs.iter().map(|p| p.1).sum();
+            let pd = probs.iter().find(|p| p.0 == d).map_or(0.0, |p| p.1) / total;
+            if self.next_f64() < pd {
+                continue;
+            }
+            probs.retain(|p| p.0 != d);
+            let next = if probs.is_empty() {
+                d
+            } else {
+                self.draw(&probs)
+            };
+            return Ok(Verified { accepted: i, next });
+        }
+        let probs = self.probs(&all[drafts.len() * v..]);
+        Ok(Verified {
+            accepted: drafts.len(),
+            next: self.draw(&probs),
+        })
     }
 }
 
 /// Version of the on-disk session format (C-4).
-pub const SAVE_FORMAT: &str = "calamardo-session-1";
+pub const SAVE_FORMAT: &str = "calamardo-session-2";
 
 /// A saved session that does not match this model or cache format.
 #[derive(Debug)]
@@ -452,20 +788,28 @@ impl std::fmt::Display for Incompatible {
 
 impl std::error::Error for Incompatible {}
 
+fn fsync(path: &std::path::Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 impl<'m> Session<'m> {
     /// Saves the live state, the tokens and the latest prompt-end snapshot
     /// as one safetensors file. `manifest` (model, cache format...) goes into
-    /// its metadata and must match on load. Writes to a temporary file first
-    /// so a crash never leaves half a file under `path`.
+    /// its metadata and must match on load. Written to a temporary file,
+    /// synced, then renamed, so a crash or power loss never leaves half a
+    /// file under `path`.
     pub fn save(
         &self,
         path: &std::path::Path,
         manifest: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
         use crate::cache::Saved;
+        anyhow::ensure!(!self.tokens.is_empty(), "nothing to save");
         let mut out = Saved::default();
         out.meta.extend(manifest.clone());
         out.meta.insert("format".into(), SAVE_FORMAT.into());
+        out.meta.insert("pure".into(), self.pure.to_string());
         out.arrays.push((
             "tokens".into(),
             Array::from_slice(&self.tokens, &[self.tokens.len() as i32]),
@@ -473,22 +817,42 @@ impl<'m> Session<'m> {
         for (i, c) in self.cache.iter().enumerate() {
             c.export(&format!("live.{i}"), &mut out);
         }
+        if let Some(d) = &self.draft {
+            d.export("draft", &mut out);
+        }
         if let Some(s) = self.snapshots.iter().rev().find(|s| s.prompt_end) {
             out.meta.insert("snap.len".into(), s.len.to_string());
+            out.meta
+                .insert("snap.aligned".into(), s.aligned.to_string());
             for (i, p) in s.passes.iter().enumerate() {
                 p.export(&format!("snap.{i}"), &mut out);
+            }
+            if let Some(d) = &s.draft {
+                d.export("snap.draft", &mut out);
             }
         }
         // MLX appends ".safetensors" to names that lack it.
         let tmp = path.with_extension("tmp.safetensors");
-        ops::save_safetensors(&tmp, &out.arrays, &out.meta)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            ops::save_safetensors(&tmp, &out.arrays, &out.meta)?;
+            fsync(&tmp)?;
+            std::fs::rename(&tmp, path)?;
+            if let Some(dir) = path.parent() {
+                fsync(dir)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
-    /// Loads a session saved by `save`, checking `manifest` and the format.
+    /// Loads a session saved by `save`, checking `manifest`, the format and
+    /// that every cache holds exactly the saved tokens.
     pub fn load(
         model: &'m Model,
+        drafter: Option<&'m Drafter>,
         kv: KvFormat,
         path: &std::path::Path,
         manifest: &std::collections::BTreeMap<String, String>,
@@ -510,49 +874,53 @@ impl<'m> Session<'m> {
             meta,
         };
         let mut s = Session::new(model, kv);
+        if let Some(d) = drafter {
+            s = s.with_drafter(d);
+        }
         let tokens = l.array("tokens")?;
         ops::eval(&[&tokens])?;
         s.tokens = tokens.as_slice::<u32>().to_vec();
+        s.pure = l.meta.get("pure").is_some_and(|v| v == "true");
         for (i, c) in s.cache.iter_mut().enumerate() {
             c.import(&format!("live.{i}"), &mut l)?;
+            c.validate(s.tokens.len())?;
+        }
+        if let Some(d) = s.draft.as_mut() {
+            d.import("draft", &mut l)?;
+            anyhow::ensure!(
+                d.len as usize == s.tokens.len(),
+                "drafter context does not match the tokens"
+            );
         }
         if let Some(len) = l.meta.get("snap.len").and_then(|v| v.parse::<usize>().ok()) {
+            anyhow::ensure!(len < s.tokens.len(), "snapshot beyond the tokens");
             let passes = s
                 .cache
                 .iter()
                 .enumerate()
                 .map(|(i, c)| PassSnapshot::import(c, &format!("snap.{i}"), &mut l))
                 .collect::<Result<Vec<_>>>()?;
+            let draft = match &s.draft {
+                Some(d) => Some(DraftSnapshot::import(d, "snap.draft", &mut l)?),
+                None => None,
+            };
             s.snapshots.push(Snapshot {
                 len,
                 prompt_end: true,
+                aligned: l.meta.get("snap.aligned").is_some_and(|v| v == "true"),
                 passes,
+                draft,
             });
         }
         // Read everything now, not on the first request that touches it.
         let mut all: Vec<&Array> = s.cache.iter().flat_map(|c| c.arrays()).collect();
+        if let Some(d) = &s.draft {
+            all.extend(d.arrays());
+        }
         let snap_arrays: Vec<Array> = s.snapshots.iter().flat_map(|sn| sn.arrays()).collect();
         all.extend(snap_arrays.iter());
         ops::eval(&all)?;
+        s.origin = Some(path.to_path_buf());
         Ok(s)
-    }
-}
-
-impl Snapshot {
-    fn arrays(&self) -> Vec<Array> {
-        self.passes
-            .iter()
-            .flat_map(|p| match p {
-                crate::cache::PassSnapshot::Global { conv, .. } => {
-                    conv.iter().flatten().cloned().collect::<Vec<_>>()
-                }
-                crate::cache::PassSnapshot::Window { cache, conv } => cache
-                    .arrays()
-                    .into_iter()
-                    .cloned()
-                    .chain(conv.iter().flatten().cloned())
-                    .collect(),
-            })
-            .collect()
     }
 }

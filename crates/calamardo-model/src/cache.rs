@@ -60,7 +60,7 @@ impl KvCache {
         self.keys_and_values()
     }
 
-    fn keys_and_values(&self) -> Result<(Array, Array)> {
+    pub fn keys_and_values(&self) -> Result<(Array, Array)> {
         let k = self.keys.as_ref().unwrap();
         let v = self.values.as_ref().unwrap();
         if self.offset < k.shape()[2] {
@@ -75,6 +75,12 @@ impl KvCache {
 
     pub fn arrays(&self) -> Vec<&Array> {
         self.keys.iter().chain(self.values.iter()).collect()
+    }
+
+    /// The whole key and value buffers (capacity may exceed `offset`), for
+    /// kernels that read the first `offset` tokens in place.
+    pub fn buffers(&self) -> Option<(&Array, &Array)> {
+        Some((self.keys.as_ref()?, self.values.as_ref()?))
     }
 
     /// Forgets everything after the first `offset` tokens. The buffers stay;
@@ -222,6 +228,13 @@ impl RotatingKvCache {
         } else {
             Ok((k.clone(), v.clone()))
         }
+    }
+
+    /// The cached keys and values, oldest first.
+    pub fn temporal(&self) -> Result<(Array, Array)> {
+        let k = self.keys.as_ref().context("empty window cache")?;
+        let v = self.values.as_ref().context("empty window cache")?;
+        Ok((self.temporal_order(k)?, self.temporal_order(v)?))
     }
 
     pub fn update_and_fetch(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
@@ -439,6 +452,9 @@ pub struct PassCache {
     /// Short-convolution states: k, v, post-attention, post-MLP. Each is
     /// float32 (B, kernel_size - 1, C).
     pub conv: [Option<Array>; 4],
+    /// Convolution windows (state + inputs) of the last speculative
+    /// verification, to rewind `conv` to an accepted token.
+    pub windows: Option<[Array; 4]>,
 }
 
 impl PassCache {
@@ -449,6 +465,7 @@ impl PassCache {
             AttnCache::Window(c) => c.arrays(),
         };
         out.extend(self.conv.iter().flatten());
+        out.extend(self.windows.iter().flatten());
         out
     }
 }
@@ -494,6 +511,7 @@ impl PassCache {
     /// Returns to `snap`, which must come from this sequence (an ancestor of
     /// the current state).
     pub fn restore(&mut self, snap: &PassSnapshot) {
+        self.windows = None;
         match (snap, &mut self.attn) {
             (PassSnapshot::Window { cache, conv }, AttnCache::Window(c)) => {
                 *c = cache.clone();
@@ -683,5 +701,145 @@ impl PassSnapshot {
                 conv: import_conv(p, l),
             },
         })
+    }
+}
+
+impl RotatingKvCache {
+    /// Forgets the last `n` tokens of a multi-token (concatenating) update,
+    /// whose keys are in temporal order.
+    fn drop_last(&mut self, n: i32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let k = self.keys.as_ref().context("empty window cache")?;
+        let len = k.shape()[2];
+        anyhow::ensure!(
+            self.idx == len && n <= len,
+            "window cache is not in temporal order"
+        );
+        self.keys = Some(ops::slice(k, 2, 0, len - n, 1)?);
+        self.values = Some(ops::slice(self.values.as_ref().unwrap(), 2, 0, len - n, 1)?);
+        self.offset -= n;
+        self.idx = len - n;
+        Ok(())
+    }
+}
+
+impl PassCache {
+    /// After a speculative verification that fed `fed` tokens, keeps only
+    /// the first `keep` of them (rejected drafts leave no trace).
+    pub fn rewind(&mut self, fed: i32, keep: i32) -> Result<()> {
+        let drop = fed - keep;
+        match &mut self.attn {
+            AttnCache::Global(c) => c.truncate(c.offset - drop),
+            AttnCache::Quantized(c) => c.truncate(c.offset - drop),
+            AttnCache::Window(c) => c.drop_last(drop)?,
+        }
+        if let Some(windows) = self.windows.take()
+            && drop > 0
+        {
+            for (state, window) in self.conv.iter_mut().zip(windows.iter()) {
+                // The window is the previous state followed by the `fed`
+                // inputs; the state after `keep` of them starts at row `keep`.
+                let n = state.as_ref().context("convolution state")?.shape()[1];
+                let pos = ops::reshape(&ops::arange(keep, keep + n)?, &[1, n, 1])?;
+                *state = Some(ops::take_along_axis(window, &pos, 1)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Capacity kept after a fork: the valid tokens rounded up to a block.
+fn shrunk(offset: i32) -> i32 {
+    (offset + STEP - 1) / STEP * STEP
+}
+
+impl KvCache {
+    pub fn export(&self, p: &str, out: &mut Saved) {
+        if let (Some(k), Some(v)) = (&self.keys, &self.values) {
+            out.arrays.push((format!("{p}.k"), k.clone()));
+            out.arrays.push((format!("{p}.v"), v.clone()));
+        }
+        out.meta
+            .insert(format!("{p}.offset"), self.offset.to_string());
+    }
+
+    pub fn import(&mut self, p: &str, l: &mut Loaded) -> Result<()> {
+        self.keys = l.opt(&format!("{p}.k"));
+        self.values = l.opt(&format!("{p}.v"));
+        self.offset = l.int(&format!("{p}.offset"))?;
+        let cap = self.keys.as_ref().map_or(0, |k| k.shape()[2]);
+        anyhow::ensure!(
+            self.offset >= 0 && self.offset <= cap,
+            "{p}: offset {} beyond {cap}",
+            self.offset
+        );
+        Ok(())
+    }
+
+    /// Drops capacity beyond the valid tokens, so the first write after a
+    /// fork copies only the prefix, not the whole shared buffer.
+    pub fn shrink(&mut self) -> Result<()> {
+        let n = shrunk(self.offset);
+        if let (Some(k), Some(v)) = (&self.keys, &self.values)
+            && k.shape()[2] > n
+        {
+            self.keys = Some(ops::slice(k, 2, 0, n, 1)?);
+            self.values = Some(ops::slice(v, 2, 0, n, 1)?);
+        }
+        Ok(())
+    }
+}
+
+impl QuantKvCache {
+    fn shrink(&mut self) -> Result<()> {
+        let n = shrunk(self.offset);
+        if let (Some(k), Some(v)) = (&self.keys, &self.values)
+            && k.w.shape()[2] > n
+        {
+            self.keys = Some(k.map(|a| ops::slice(a, 2, 0, n, 1))?);
+            self.values = Some(v.map(|a| ops::slice(a, 2, 0, n, 1))?);
+        }
+        Ok(())
+    }
+}
+
+impl RotatingKvCache {
+    pub fn max_size(&self) -> i32 {
+        self.max_size
+    }
+
+    pub fn export(&self, p: &str, out: &mut Saved) {
+        export_window(p, self, out);
+    }
+
+    pub fn import(&mut self, p: &str, l: &mut Loaded) -> Result<()> {
+        import_window(p, self, l)
+    }
+}
+
+impl PassCache {
+    /// See `KvCache::shrink`.
+    pub fn shrink(&mut self) -> Result<()> {
+        match &mut self.attn {
+            AttnCache::Global(c) => c.shrink(),
+            AttnCache::Quantized(c) => c.shrink(),
+            AttnCache::Window(_) => Ok(()),
+        }
+    }
+
+    /// Checks a loaded cache against the number of tokens it should hold.
+    pub fn validate(&self, tokens: usize) -> Result<()> {
+        let (offset, cap) = match &self.attn {
+            AttnCache::Global(c) => (c.offset, c.keys.as_ref().map_or(0, |k| k.shape()[2])),
+            AttnCache::Quantized(c) => (c.offset, c.keys.as_ref().map_or(0, |k| k.w.shape()[2])),
+            AttnCache::Window(c) => (c.offset, i32::MAX),
+        };
+        anyhow::ensure!(
+            offset as usize == tokens && offset <= cap,
+            "cache holds {offset} tokens (capacity {cap}), expected {tokens}"
+        );
+        Ok(())
     }
 }

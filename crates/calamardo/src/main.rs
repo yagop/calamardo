@@ -77,6 +77,12 @@ enum Cmd {
         /// GB of SSD for saved conversations; 0 disables the disk cache.
         #[arg(long, env = "CALAMARDO_DISK_CACHE_GB", default_value_t = 50.0)]
         disk_cache_gb: f64,
+        /// Decode without the DSpark drafter.
+        #[arg(long)]
+        no_draft: bool,
+        /// Largest draft block (anchor plus drafts), 2 to 8.
+        #[arg(long, default_value_t = 8)]
+        draft_block: usize,
     },
     /// KV cache quality: generates greedily with a bf16 cache, then replays
     /// the same tokens with each quantized format and reports the mean KL
@@ -150,7 +156,14 @@ fn main() -> Result<()> {
             aligned_prefix,
             disk_cache_dir,
             disk_cache_gb,
+            no_draft,
+            draft_block,
         } => {
+            anyhow::ensure!(prefill_step > 0, "--prefill-step must be positive");
+            anyhow::ensure!(
+                (2..=8).contains(&draft_block),
+                "--draft-block must be 2 to 8"
+            );
             let disk_cache = if disk_cache_gb > 0.0 {
                 let dir = match disk_cache_dir {
                     Some(d) => d,
@@ -175,6 +188,8 @@ fn main() -> Result<()> {
                 cache_budget: (cache_gb * 1e9) as usize,
                 aligned_prefix,
                 disk_cache,
+                speculative: !no_draft,
+                draft_block,
             };
             tokio::runtime::Runtime::new()?.block_on(calamardo_server::serve(cfg))
         }

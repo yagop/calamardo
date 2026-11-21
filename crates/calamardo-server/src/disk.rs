@@ -19,10 +19,14 @@ use calamardo_ckpt::{Dtype, safetensors::read_header};
 use calamardo_model::{
     Model,
     cache::KvFormat,
-    generate::{Reuse, SAVE_FORMAT, Session},
+    draft::Drafter,
+    generate::{Incompatible, Reuse, SAVE_FORMAT, Session},
 };
 
 struct Entry {
+    /// Loaded and still in RAM: the file stays as a backup until the session
+    /// is saved again, but it is not offered for reuse or evicted.
+    resident: bool,
     path: PathBuf,
     tokens: Vec<u32>,
     /// Length of the saved prompt-end snapshot, if any.
@@ -94,6 +98,7 @@ impl DiskCache {
                 Some((meta, tokens)) => {
                     let md = std::fs::metadata(&path)?;
                     entries.push(Entry {
+                        resident: false,
                         snapshot: meta.get("snap.len").and_then(|v| v.parse().ok()),
                         path,
                         tokens,
@@ -119,7 +124,7 @@ impl DiskCache {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.iter().filter(|e| !e.resident).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -130,6 +135,14 @@ impl DiskCache {
         self.entries.iter().map(|e| e.bytes).sum()
     }
 
+    /// A resident file whose session left RAM without being saved becomes
+    /// an ordinary entry again.
+    pub fn release(&mut self, path: &Path) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
+            e.resident = false;
+        }
+    }
+
     /// The saved conversation that holds the longest start of `prompt`.
     pub fn best(&self, prompt: &[u32], aligned_to: Option<usize>) -> Option<(usize, Reuse)> {
         let ok = |len: usize| {
@@ -138,6 +151,7 @@ impl DiskCache {
         self.entries
             .iter()
             .enumerate()
+            .filter(|(_, e)| !e.resident)
             .filter_map(|(i, e)| {
                 let common = e
                     .tokens
@@ -157,22 +171,37 @@ impl DiskCache {
 
     /// The most recently used conversation (for prewarming).
     pub fn latest(&self) -> Option<usize> {
-        (0..self.entries.len()).max_by_key(|&i| self.entries[i].used)
+        (0..self.entries.len())
+            .filter(|&i| !self.entries[i].resident && !self.entries[i].tokens.is_empty())
+            .max_by_key(|&i| self.entries[i].used)
     }
 
-    /// Loads conversation `i` into RAM and removes it from disk (it is saved
-    /// again when evicted or at shutdown). Returns the session and seconds.
+    /// Loads conversation `i` into RAM. The file stays (marked resident) so
+    /// a crash does not lose it; it is replaced when the session is saved
+    /// again. Only an incompatible file is deleted. Returns the session and
+    /// the seconds it took.
     pub fn take<'m>(
         &mut self,
         i: usize,
         model: &'m Model,
+        drafter: Option<&'m Drafter>,
         kv: KvFormat,
     ) -> Result<(Session<'m>, f64)> {
-        let e = self.entries.remove(i);
         let t = Instant::now();
-        let result = Session::load(model, kv, &e.path, &self.manifest);
-        let _ = std::fs::remove_file(&e.path);
-        Ok((result?, t.elapsed().as_secs_f64()))
+        let path = self.entries[i].path.clone();
+        match Session::load(model, drafter, kv, &path, &self.manifest) {
+            Ok(s) => {
+                self.entries[i].resident = true;
+                Ok((s, t.elapsed().as_secs_f64()))
+            }
+            Err(e) => {
+                if e.downcast_ref::<Incompatible>().is_some() {
+                    let _ = std::fs::remove_file(&path);
+                    self.entries.remove(i);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Saves a conversation evicted from RAM, then keeps the disk within
@@ -184,7 +213,15 @@ impl DiskCache {
             .join(format!("{:016x}.safetensors", hash(&session.tokens)));
         session.save(&path, &self.manifest)?;
         self.entries.retain(|e| e.path != path);
+        // The file it was loaded from is now superseded.
+        if let Some(origin) = &session.origin
+            && *origin != path
+        {
+            let _ = std::fs::remove_file(origin);
+            self.entries.retain(|e| e.path != *origin);
+        }
         self.entries.push(Entry {
+            resident: false,
             bytes: std::fs::metadata(&path)?.len(),
             path,
             tokens: session.tokens.clone(),
@@ -201,11 +238,15 @@ impl DiskCache {
     }
 
     fn evict(&mut self) {
-        while self.bytes() > self.budget && !self.entries.is_empty() {
-            let oldest = (0..self.entries.len())
+        while self.bytes() > self.budget {
+            let Some(oldest) = (0..self.entries.len())
+                .filter(|&i| !self.entries[i].resident)
                 .min_by_key(|&i| self.entries[i].used)
-                .unwrap();
+            else {
+                break;
+            };
             let e = self.entries.remove(oldest);
+            eprintln!("disk cache full: removing {} tokens", e.tokens.len());
             let _ = std::fs::remove_file(&e.path);
         }
     }

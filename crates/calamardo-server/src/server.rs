@@ -65,6 +65,10 @@ pub struct ServerConfig {
     pub aligned_prefix: bool,
     /// Prefix cache on disk: directory and byte budget (None disables it).
     pub disk_cache: Option<(PathBuf, u64)>,
+    /// Speculative decoding with the DSpark drafter (M-7).
+    pub speculative: bool,
+    /// Largest draft block (anchor plus drafts).
+    pub draft_block: usize,
 }
 
 struct App {
@@ -125,11 +129,9 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
             cache_budget: cfg.cache_budget,
             aligned_prefix: cfg.aligned_prefix,
             disk: cfg.disk_cache.clone(),
-            model_id: cfg
-                .model_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            model_id: worker::model_id(&cfg.model_dir),
+            speculative: cfg.speculative,
+            draft_block: cfg.draft_block,
         },
         queue.clone(),
         metrics.clone(),
@@ -162,18 +164,43 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         .with_state(app.clone());
     let (queue_for_shutdown, app_for_shutdown) = (app.queue.clone(), app);
     eprintln!("listening on http://{addr}");
+    let closing = queue_for_shutdown.clone();
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Refuse queued requests and stop the running one at once, so
+            // open connections finish quickly; a second signal exits now.
+            eprintln!("shutting down: saving conversations (signal again to exit now)");
+            closing.close();
+            tokio::spawn(async {
+                shutdown_signal().await;
+                eprintln!("exiting without saving");
+                std::process::exit(130);
+            });
         })
         .await?;
     // Let the model thread finish and save its conversations to disk.
-    eprintln!("shutting down: saving conversations");
     queue_for_shutdown.close();
     while !app_for_shutdown.worker.is_finished() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(())
+}
+
+/// Ctrl-C or SIGTERM.
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = async {
+            match term.as_mut() {
+                Some(t) => {
+                    t.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+    }
 }
 
 fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {

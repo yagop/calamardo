@@ -63,7 +63,7 @@ fn restore_and_fork_reproduce_greedy() {
                 len: PROMPT.len() - 1
             }
         );
-        let mut fork = s.fork(0);
+        let mut fork = s.fork(0).unwrap();
         assert_eq!(fork.tokens.len(), PROMPT.len() - 1);
         let lp = fork
             .feed(&PROMPT[PROMPT.len() - 1..], &no, &mut |_| {})
@@ -119,7 +119,7 @@ fn saved_session_continues_exactly() {
         let first = decode(&mut s, &lp, 20);
         let path = tmp.join(format!("{}.safetensors", kv.bits));
         s.save(&path, &manifest).unwrap();
-        let mut loaded = Session::load(&model, kv, &path, &manifest).unwrap();
+        let mut loaded = Session::load(&model, None, kv, &path, &manifest).unwrap();
         assert_eq!(loaded.tokens, s.tokens);
 
         // Both continue with the same next token and the same decode.
@@ -150,7 +150,7 @@ fn saved_session_continues_exactly() {
         let other = [("kv_bits".to_string(), "99".to_string())]
             .into_iter()
             .collect();
-        assert!(Session::load(&model, kv, &path, &other).is_err());
+        assert!(Session::load(&model, None, kv, &path, &other).is_err());
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }

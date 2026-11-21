@@ -279,3 +279,72 @@ fn bench_decode_160k() {
         2.0 * (HKV * s * D * 2) as f64 / ms / 1e6
     );
 }
+
+/// The same kernel over a bf16 cache (speculative verification), against
+/// the float64 reference.
+#[test]
+fn bf16_attention_matches_reference() {
+    use calamardo_model::cache::Packed;
+    let kern = Kernels::new().unwrap();
+    let scale = (D as f64).powf(-0.5);
+    for s in [1, 300, 2500] {
+        for l in [2, 5, 8] {
+            if l > s {
+                continue;
+            }
+            // Capacity beyond the valid tokens, as in the growing cache.
+            let cap = s + 37;
+            let kv = bf16(
+                data((HKV * cap * D) as usize, 21 + s as u32, 2.0),
+                &[1, HKV, cap, D],
+            );
+            let vv = bf16(
+                data((HKV * cap * D) as usize, 22 + s as u32, 1.0),
+                &[1, HKV, cap, D],
+            );
+            let wrap = |a: &Array| Packed {
+                w: a.clone(),
+                scales: a.clone(),
+                biases: a.clone(),
+            };
+            let q = bf16(
+                data((HQ * l * D) as usize, 31 + l as u32, 0.2),
+                &[1, HQ, l, D],
+            );
+            let rel = bf16(data((l * HQ * R) as usize, 33, 1.0), &[1, l, HQ, R]);
+            let sinks = bf16(data((l * HQ) as usize, 37, 2.0), &[1, l, HQ]);
+            let out = kern
+                .quantized_decode_attention(
+                    &q,
+                    &wrap(&kv),
+                    &wrap(&vv),
+                    s,
+                    &rel,
+                    &sinks,
+                    scale as f32,
+                    KvFormat::BF16,
+                )
+                .unwrap();
+            let got = host(&out);
+            let k = ops::slice(&kv, 2, 0, s, 1).unwrap();
+            let v = ops::slice(&vv, 2, 0, s, 1).unwrap();
+            let want = reference(
+                &host(&q),
+                &host(&k),
+                &host(&v),
+                &host(&rel),
+                &host(&sinks),
+                s,
+                l,
+                scale,
+            );
+            for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                let tol = b.abs() * 2.0f64.powi(-7) + 1e-3;
+                assert!(
+                    (a as f64 - b).abs() <= tol,
+                    "bf16 S {s} L {l} [{i}]: {a} vs {b}"
+                );
+            }
+        }
+    }
+}

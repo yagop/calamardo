@@ -14,7 +14,9 @@ use calamardo_ckpt::{
 use mlx_rs::{Array, Dtype};
 
 use crate::{
-    cache::{AttnCache, KvCache, KvFormat, PassCache, QuantKvCache, RotatingKvCache, conv_state},
+    cache::{
+        AttnCache, KvCache, KvFormat, Packed, PassCache, QuantKvCache, RotatingKvCache, conv_state,
+    },
     kernels::{Kernels, MAX_DECODE_QUERIES},
     ops::{self, f32s},
 };
@@ -455,6 +457,31 @@ impl Attention {
                     )?
                 }
             }
+            AttnCache::Global(c) if (2..=MAX_DECODE_QUERIES).contains(&l) => {
+                // Speculative verification: the decode kernel over the bf16
+                // cache in place (the prefill kernel has too few threadgroups
+                // for a handful of queries over a long context).
+                c.update_and_fetch(&k, &v)?;
+                let (kb, vb) = c.buffers().context("empty cache")?;
+                // Scales and biases are not read for 16 bits; the buffer
+                // itself stands in (MLX passes small arrays as constants,
+                // which the kernel's device pointers cannot take).
+                let wrap = |a: &Array| Packed {
+                    w: a.clone(),
+                    scales: a.clone(),
+                    biases: a.clone(),
+                };
+                kern.quantized_decode_attention(
+                    &q,
+                    &wrap(kb),
+                    &wrap(vb),
+                    c.offset,
+                    &position_bias,
+                    &sinks,
+                    self.scaling,
+                    KvFormat::BF16,
+                )?
+            }
             attn => {
                 let (k, v) = attn.update_and_fetch(&k, &v)?;
                 self.attention(kern, &q, &k, &v, &position_bias, &sinks, attn)?
@@ -836,6 +863,7 @@ impl Layer {
         block_states: Option<&Array>,
         cache: &mut PassCache,
         messages: Option<&Array>,
+        keep_windows: bool,
     ) -> Result<(Array, Array)> {
         let dtype = hidden.dtype();
         let block_residual = hidden;
@@ -895,6 +923,15 @@ impl Layer {
         cache.conv[3] = Some(w3);
 
         let n = self.post_mlp_convolution.kernel_size - 1;
+        if keep_windows {
+            // Speculative verification: keep the windows so the states can be
+            // rewound to any accepted token.
+            let w: Vec<Array> = cache.conv.iter().flatten().cloned().collect();
+            cache.windows = Some(
+                w.try_into()
+                    .map_err(|_| anyhow::anyhow!("missing convolution window"))?,
+            );
+        }
         for c in cache.conv.iter_mut() {
             let window = c.take().context("convolution window")?;
             *c = Some(conv_state(&window, n)?);
@@ -1049,6 +1086,17 @@ impl Model {
         })
     }
 
+    /// `model.embed`: embeddings of `tokens` (B, L) after `embed_norm`.
+    pub fn embed(&self, tokens: &Array) -> Result<Array> {
+        let h = ops::take(&self.embed, tokens, 0)?;
+        ops::rms_norm(&h, Some(&self.embed_norm), self.text().rms_norm_eps)
+    }
+
+    /// The vocabulary projection (V, D).
+    pub fn lm_head(&self) -> &Array {
+        &self.lm_head
+    }
+
     fn text(&self) -> &TextConfig {
         &self.config.text_config
     }
@@ -1071,13 +1119,31 @@ impl Model {
                     ),
                 },
                 conv: [None, None, None, None],
+                windows: None,
             })
             .collect()
     }
 
     /// tokens: (1, L) int32. Returns float32 logits (1, L, unpadded vocab).
     pub fn forward(&self, tokens: &Array, cache: &mut [PassCache]) -> Result<Array> {
+        Ok(self.forward_ex(tokens, cache, &[], false)?.0)
+    }
+
+    /// `forward`, also returning the hidden states entering the passes in
+    /// `capture` (index `num_passes` is the final normalized output),
+    /// concatenated on the last axis as the drafter reads them; and with
+    /// `keep_windows`, keeping each pass's convolution windows for a
+    /// speculative rollback.
+    pub fn forward_ex(
+        &self,
+        tokens: &Array,
+        cache: &mut [PassCache],
+        capture: &[usize],
+        keep_windows: bool,
+    ) -> Result<(Array, Option<Array>)> {
         let cfg = self.text();
+        let mut captured: Vec<(usize, Array)> = Vec::new();
+        let mut pass = 0usize;
         let k = &self.kernels;
         let bounded = tokens.shape()[1] >= self.bounded_prefill_from;
         let h = ops::take(&self.embed, tokens, 0)?;
@@ -1102,8 +1168,14 @@ impl Model {
                     }
                     None => None,
                 };
+                if capture.contains(&pass) {
+                    // DSpark taps the hidden state entering the pass.
+                    captured.push((pass, h.clone()));
+                }
+                pass += 1;
                 let c = caches.next().context("not enough caches")?;
-                let (nh, nbs) = layer.forward(k, &h, bs.as_ref(), c, messages.as_ref())?;
+                let (nh, nbs) =
+                    layer.forward(k, &h, bs.as_ref(), c, messages.as_ref(), keep_windows)?;
                 debug_assert!(layer.index < cfg.num_hidden_layers);
                 if bounded {
                     // Bounded prefill (K-1, K-3): finish this pass before the
@@ -1153,9 +1225,31 @@ impl Model {
             dtype,
         )?;
 
+        if capture.contains(&pass) {
+            captured.push((pass, h.clone()));
+        }
+        let hidden = if capture.is_empty() {
+            None
+        } else {
+            let parts: Vec<&Array> = capture
+                .iter()
+                .map(|id| {
+                    captured
+                        .iter()
+                        .find(|(p, _)| p == id)
+                        .map(|(_, a)| a)
+                        .context("capture id out of range")
+                })
+                .collect::<Result<_>>()?;
+            Some(ops::concatenate(&parts, -1)?)
+        };
+
         let logits = ops::f32(&ops::linear(&h, &self.lm_head)?)?;
         let cap = f32s(cfg.final_logit_softcapping);
         let logits = ops::mul(&ops::tanh(&ops::div(&logits, &cap)?)?, &cap)?;
-        ops::slice(&logits, -1, 0, cfg.unpadded_vocab_size as i32, 1)
+        Ok((
+            ops::slice(&logits, -1, 0, cfg.unpadded_vocab_size as i32, 1)?,
+            hidden,
+        ))
     }
 }

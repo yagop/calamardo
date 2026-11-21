@@ -701,3 +701,54 @@ pub fn save_safetensors(
     }
     Ok(())
 }
+
+/// `mx.fast.rope(x, dims, traditional=False, base, scale=1, offset)`.
+pub fn rope(x: &Array, dims: i32, base: f32, offset: i32) -> Result<Array> {
+    let base = sys::mlx_optional_float {
+        value: base,
+        has_value: true,
+    };
+    op("rope", |r, s| unsafe {
+        sys::mlx_fast_rope(r, x.as_ptr(), dims, false, base, 1.0, offset, null(), s)
+    })
+}
+
+/// `mx.split(a, n, axis)` into `n` equal parts.
+pub fn split_equal(a: &Array, n: i32, axis: i32) -> Result<Vec<Array>> {
+    let s = stream();
+    // SAFETY: `res` is a fresh vector, wrapped so it is freed.
+    let res = unsafe {
+        let mut res = sys::mlx_vector_array_new();
+        if sys::mlx_split(&mut res, a.as_ptr(), n, axis, s.as_ptr()) != 0 {
+            sys::mlx_vector_array_free(res);
+            bail!("MLX op split failed: {}", last_error());
+        }
+        Vector(res)
+    };
+    (0..n as usize).map(|i| res.get(i)).collect()
+}
+
+/// `mx.fast.scaled_dot_product_attention` without mask or sinks.
+pub fn sdpa_nomask(q: &Array, k: &Array, v: &Array, scale: f32) -> Result<Array> {
+    op("scaled_dot_product_attention", |r, s| unsafe {
+        sys::mlx_fast_scaled_dot_product_attention(
+            r,
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            scale,
+            c"".as_ptr(),
+            null(),
+            null(),
+            false,
+            s,
+        )
+    })
+}
+
+/// `mx.addmm(c, a, b)`: `c + a @ b`.
+pub fn addmm(c: &Array, a: &Array, b: &Array) -> Result<Array> {
+    op("addmm", |r, s| unsafe {
+        sys::mlx_addmm(r, c.as_ptr(), a.as_ptr(), b.as_ptr(), 1.0, 1.0, s)
+    })
+}

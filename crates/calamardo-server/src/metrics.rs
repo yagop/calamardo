@@ -15,6 +15,9 @@ pub struct Metrics {
     cache_sessions: AtomicU64,
     cache_bytes: AtomicU64,
     disk_sessions: AtomicU64,
+    drafted_tokens: AtomicU64,
+    accepted_tokens: AtomicU64,
+    draft_rounds: AtomicU64,
     disk_bytes: AtomicU64,
     disk_loads: AtomicU64,
     disk_saves: AtomicU64,
@@ -63,6 +66,13 @@ impl Metrics {
 
     pub fn error(&self) {
         self.errors.fetch_add(1, Relaxed);
+    }
+
+    /// One speculative round (M-7).
+    pub fn draft(&self, accepted: usize, drafted: usize) {
+        self.draft_rounds.fetch_add(1, Relaxed);
+        self.drafted_tokens.fetch_add(drafted as u64, Relaxed);
+        self.accepted_tokens.fetch_add(accepted as u64, Relaxed);
     }
 
     pub fn set_disk(&self, sessions: usize, bytes: usize) {
@@ -207,6 +217,24 @@ impl Metrics {
             "gauge",
             "Time of the last save to disk.",
             f(&self.last_disk_save_seconds).to_string(),
+        );
+        put(
+            "draft_rounds_total",
+            "counter",
+            "Speculative rounds.",
+            u(&self.draft_rounds).to_string(),
+        );
+        put(
+            "drafted_tokens_total",
+            "counter",
+            "Tokens proposed by the drafter.",
+            u(&self.drafted_tokens).to_string(),
+        );
+        put(
+            "accepted_tokens_total",
+            "counter",
+            "Drafted tokens the target accepted.",
+            u(&self.accepted_tokens).to_string(),
         );
         put(
             "prefix_cache_bytes",

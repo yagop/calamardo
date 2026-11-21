@@ -308,8 +308,8 @@ const QUANT_DECODE_PARTIAL_SOURCE: &str = r#"
     constexpr int ROW_BYTES = D * BITS / 8;
     constexpr int NG = D / GROUP;
     constexpr int HQ = HKV * G;
-    constexpr int WORDS = DPL * BITS / 32; // u32 words per lane and row
-    constexpr int PER_WORD = 32 / BITS;
+    constexpr int WORDS = BITS == 16 ? 1 : DPL * BITS / 32; // u32 words per lane and row
+    constexpr int PER_WORD = BITS == 16 ? 1 : 32 / BITS;
     const int S = sizes[0];
     const int cap = sizes[1];
     const uint lane = thread_index_in_simdgroup;
@@ -353,7 +353,15 @@ const QUANT_DECODE_PARTIAL_SOURCE: &str = r#"
         const bool valid = j < j1;
         float kf[DPL];
         float vf[DPL];
-        if (valid) {
+        if (valid && BITS == 16) {
+            // A bf16 cache, read as is.
+            const device T* kr = (const device T*)(kbytes + size_t(j) * ROW_BYTES) + d0;
+            const device T* vr = (const device T*)(vbytes + size_t(j) * ROW_BYTES) + d0;
+            for (int i = 0; i < DPL; i++) {
+                kf[i] = float(kr[i]);
+                vf[i] = float(vr[i]);
+            }
+        } else if (valid) {
             const T k_scale = ksc[size_t(j) * NG + gi];
             const T k_bias = kbi[size_t(j) * NG + gi];
             const T v_scale = vsc[size_t(j) * NG + gi];
@@ -690,7 +698,7 @@ impl Kernels {
             "quantized decode takes at most {MAX_DECODE_QUERIES} queries"
         );
         anyhow::ensure!(
-            d % 32 == 0 && d % format.group_size == 0,
+            d % 32 == 0 && (format.bits == 16 || d % format.group_size == 0),
             "unsupported head_dim {d}"
         );
         let [_, hkv, cap, _] = keys.w.shape()[..] else {

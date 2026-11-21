@@ -301,6 +301,27 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
   - 166.561 tokens: guardar 0,51 s, restaurar 0,10 s (objetivo ≤ 2 s); el turno siguiente reutiliza 166.590 de 166.598 tokens y tarda 2,4 s en total, frente a 317 s en frío. Ojo: el archivo se acababa de escribir y la lectura salió de la caché de páginas del sistema; la lectura en frío del SSD no está medida (requiere `sudo purge`), aunque unos 3,5 GB caben con holgura en 2 s a la velocidad del SSD del M4 Max.
 - `/metrics` añade `disk_cache_sessions`, `disk_cache_bytes`, `disk_loads_total`, `disk_saves_total` y los tiempos del último guardado y la última carga.
 - Pendiente: medir el desgaste del SSD con el uso diario (pregunta abierta).
+- Revisión (subagente), corregido:
+  - Una conversación cargada del disco ya no se borra: su archivo queda como respaldo hasta que otra versión la sustituye. Si una petición falla, la sesión vuelve a su última instantánea en vez de perderse. Al leer de disco, solo se borra un archivo si es incompatible.
+  - `--aligned-prefix` usa solo instantáneas a las que se llegó con trozos completos desde el principio (marca guardada también en disco) y nunca el final vivo, así que es bit-exacto de verdad.
+  - Las sesiones vacías no se guardan ni se precargan.
+  - Bifurcar recorta la capacidad al prefijo (la primera escritura copia solo eso), y solo se bifurca si la rama original tiene otro turno de usuario; regenerar una respuesta sustituye la anterior.
+  - Cierre: Ctrl-C o SIGTERM rechazan la cola, paran la petición en curso (que se conserva, C-7), guardan y salen; una segunda señal sale sin guardar.
+  - Al cargar se valida que cada caché tenga exactamente los tokens guardados; al guardar se hace `fsync` del archivo y del directorio y se borra el temporal si algo falla.
+  - El modelo se identifica por un hash de `config.json`, el índice de tensores y los tamaños de los archivos, no por el nombre del directorio; en modo alineado el manifiesto incluye el tamaño del trozo.
+
+**Hito 7: drafter DSpark (estado)**
+
+- Port operación a operación del drafter de mlx-vlm (a su vez de vLLM): 3 capas con fusión DFlare de los estados del modelo principal en las pasadas 5, 23 y 41 y la salida final, y cabeza Markov recurrente (proyección plegada en el vocabulario). Propone hasta 7 tokens por bloque.
+- El contexto del drafter vive en la sesión: se alimenta trozo a trozo durante el prefill, sigue a cada token aceptado y entra en las instantáneas y en el disco, así que una conversación recuperada de la caché sigue especulando sin recalcular.
+- Verificación: un forward del modelo principal sobre el último token y los borradores; se aceptan los que coinciden con el greedy (o, con temperatura, cada borrador `d` con probabilidad p(d) y, si no, se muestrea de p sin `d`, lo que reproduce exactamente la distribución del modelo). Las cachés se rebobinan a lo aceptado: las globales por offset, la ventana quitando las últimas claves y los estados de convolución desde sus ventanas. Un token de parada entre los aceptados corta la ronda ahí.
+- Longitud adaptativa (M-7): la política de mlx-vlm para DFlash según la aceptación reciente (entre 4 y 8), y además según la velocidad medida con y sin borrador: si especular no compensa, decodifica sin borrador y vuelve a probar cada 16 decisiones.
+- La verificación de 2 a 8 tokens con caché bf16 usa el kernel de decode directo (que ahora también lee bf16): con el kernel de prefill era lenta a contexto largo. Prueba K-8 añadida.
+- Test: con greedy, la especulación coincide con el decode normal hasta un casi-empate (la primera diferencia, en el token 155 de 200, con 0,17 nats entre los dos mejores en bf16 y 0,11 en 8 bits), en bf16 y 8 bits.
+- Medido (greedy, caché 16 bits salvo indicación):
+  - Contexto corto (código Python, 400 tokens): 45,8 tok/s con drafter frente a 34,3 sin él; aceptación 52 %.
+  - 31k de contexto (500 tokens): 31,1 tok/s con drafter frente a 32,5 sin él; aceptación 41 %. El objetivo de ≥ 40 tok/s a 29k no se cumple. Con contexto largo verificar un bloque cuesta casi lo que gana: el MoE lee los expertos de hasta 8 tokens y la atención hace 8 veces el trabajo por clave. Queda pendiente un kernel de verificación con multiplicación matricial (tipo flash, repartido por claves), que encaja con K-2 del Hito 8.
+- `--no-draft` lo desactiva y `--draft-block` limita el bloque. `/metrics` añade `draft_rounds_total`, `drafted_tokens_total` y `accepted_tokens_total`.
 
 **Incoherencias a resolver**
 

@@ -2,6 +2,7 @@
 //! greedy generation.
 
 pub mod cache;
+pub mod draft;
 pub mod generate;
 pub mod kernels;
 pub mod model;
