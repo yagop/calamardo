@@ -89,3 +89,68 @@ fn restore_and_fork_reproduce_greedy() {
         );
     }
 }
+
+#[test]
+fn saved_session_continues_exactly() {
+    let Ok(dir) = snapshot_dir(&default_hub_cache().unwrap(), DEFAULT_REPO, "main") else {
+        eprintln!("checkpoint not downloaded; skipping");
+        return;
+    };
+    let model = Model::load(&dir).unwrap();
+    let no = AtomicBool::new(false);
+    let tmp = std::env::temp_dir().join(format!("calamardo-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for kv in [KvFormat::BF16, KvFormat::new(4, 32).unwrap()] {
+        let manifest = [("kv_bits".to_string(), kv.bits.to_string())]
+            .into_iter()
+            .collect();
+        let cold = generate::greedy(
+            &model,
+            &PROMPT,
+            30,
+            generate::PREFILL_STEP,
+            kv,
+            |_| {},
+            |_| true,
+        )
+        .unwrap();
+        let mut s = Session::new(&model, kv);
+        let lp = s.feed(&PROMPT, &no, &mut |_| {}).unwrap();
+        let first = decode(&mut s, &lp, 20);
+        let path = tmp.join(format!("{}.safetensors", kv.bits));
+        s.save(&path, &manifest).unwrap();
+        let mut loaded = Session::load(&model, kv, &path, &manifest).unwrap();
+        assert_eq!(loaded.tokens, s.tokens);
+
+        // Both continue with the same next token and the same decode.
+        let last = *first.last().unwrap();
+        let a = s.feed(&[last], &no, &mut |_| {}).unwrap();
+        let b = loaded.feed(&[last], &no, &mut |_| {}).unwrap();
+        assert_eq!(
+            decode(&mut s, &a, 10),
+            decode(&mut loaded, &b, 10),
+            "{kv:?}: live end"
+        );
+
+        // The saved prompt-end snapshot still reproduces the cold run.
+        assert_eq!(
+            loaded.reuse(&PROMPT, false),
+            Some(Reuse::Snapshot {
+                index: 0,
+                len: PROMPT.len() - 1
+            })
+        );
+        loaded.restore(0);
+        let lp = loaded
+            .feed(&PROMPT[PROMPT.len() - 1..], &no, &mut |_| {})
+            .unwrap();
+        assert_eq!(decode(&mut loaded, &lp, 30), cold, "{kv:?}: snapshot");
+
+        // A different cache format is refused.
+        let other = [("kv_bits".to_string(), "99".to_string())]
+            .into_iter()
+            .collect();
+        assert!(Session::load(&model, kv, &path, &other).is_err());
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}

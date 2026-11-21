@@ -19,7 +19,7 @@ use calamardo_model::{
 };
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
-use crate::metrics::Metrics;
+use crate::{disk::DiskCache, metrics::Metrics};
 
 pub struct Job {
     pub prompt: Vec<u32>,
@@ -64,6 +64,7 @@ pub struct Queue {
     jobs: Mutex<VecDeque<Job>>,
     ready: Condvar,
     capacity: usize,
+    closed: AtomicBool,
 }
 
 impl Queue {
@@ -72,6 +73,7 @@ impl Queue {
             jobs: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             capacity,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -106,13 +108,23 @@ impl Queue {
         Ok(())
     }
 
-    fn pop(&self) -> Job {
+    /// Stops the worker once the jobs already queued are done.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        let _q = self.lock();
+        self.ready.notify_all();
+    }
+
+    fn pop(&self) -> Option<Job> {
         let mut q = self.lock();
         loop {
             while let Some(job) = q.pop_front() {
                 if !job.cancel.load(Ordering::Relaxed) {
-                    return job;
+                    return Some(job);
                 }
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
             }
             q = self.ready.wait(q).unwrap_or_else(|e| e.into_inner());
         }
@@ -130,11 +142,17 @@ pub struct WorkerConfig {
     pub cache_budget: usize,
     /// Reuse prefixes only at multiples of `prefill_step` (bit-exact output).
     pub aligned_prefix: bool,
+    /// Directory and byte budget of the prefix cache on disk, if enabled.
+    pub disk: Option<(PathBuf, u64)>,
+    /// Identifies the checkpoint in saved sessions (its snapshot hash).
+    pub model_id: String,
 }
 
 /// Prefix cache in RAM (C-1, C-2): idle sessions with their snapshots.
 struct PrefixCache<'m> {
     model: &'m Model,
+    metrics: &'m Metrics,
+    disk: Option<DiskCache>,
     entries: Vec<(Session<'m>, u64)>,
     clock: u64,
     budget: usize,
@@ -157,6 +175,28 @@ impl<'m> PrefixCache<'m> {
             .enumerate()
             .filter_map(|(i, (s, _))| s.reuse(prompt, self.aligned).map(|r| (i, r)))
             .max_by_key(|(_, r)| r.tokens());
+        // A conversation saved on disk may hold more of the prompt (C-3).
+        let aligned_to = self.aligned.then_some(self.prefill_step);
+        let on_disk = self.disk.as_ref().and_then(|d| d.best(prompt, aligned_to));
+        if let Some((di, reuse)) = on_disk
+            && reuse.tokens() > best.map_or(0, |(_, r)| r.tokens())
+        {
+            let d = self.disk.as_mut().unwrap();
+            match d.take(di, self.model, self.kv) {
+                Ok((mut s, secs)) => {
+                    s.prefill_step = self.prefill_step;
+                    self.metrics.disk_load(secs);
+                    eprintln!("restored {} tokens from disk in {secs:.2}s", s.tokens.len());
+                    if let Reuse::Snapshot { index, .. } = reuse {
+                        s.restore(index);
+                    }
+                    self.report_disk();
+                    return (s, reuse.tokens());
+                }
+                Err(e) => eprintln!("could not restore a saved session: {e:#}"),
+            }
+            self.report_disk();
+        }
         match best {
             Some((i, Reuse::Live { len })) => (self.entries.remove(i).0, len),
             Some((i, Reuse::Snapshot { index, len })) => {
@@ -188,10 +228,63 @@ impl<'m> PrefixCache<'m> {
                 let lru = (0..self.entries.len() - 1)
                     .min_by_key(|&i| self.entries[i].1)
                     .unwrap();
-                self.entries.remove(lru);
+                let (evicted, _) = self.entries.remove(lru);
+                self.save_to_disk(&evicted);
             } else if !self.entries[0].0.drop_snapshot() {
                 break;
             }
+        }
+    }
+}
+
+impl<'m> PrefixCache<'m> {
+    /// Saves a session leaving RAM instead of losing it (C-3).
+    fn save_to_disk(&mut self, s: &Session<'m>) {
+        if let Some(d) = self.disk.as_mut() {
+            match d.save(s) {
+                Ok(secs) => {
+                    self.metrics.disk_save(secs);
+                    eprintln!("saved {} tokens to disk in {secs:.2}s", s.tokens.len());
+                }
+                Err(e) => eprintln!("could not save a session to disk: {e:#}"),
+            }
+        }
+        self.report_disk();
+    }
+
+    fn report_disk(&self) {
+        if let Some(d) = &self.disk {
+            self.metrics.set_disk(d.len(), d.bytes() as usize);
+        }
+    }
+
+    /// Loads the most recent saved conversation into RAM (C-9).
+    fn prewarm(&mut self) {
+        let Some(i) = self.disk.as_ref().and_then(|d| d.latest()) else {
+            return;
+        };
+        match self.disk.as_mut().unwrap().take(i, self.model, self.kv) {
+            Ok((mut s, secs)) => {
+                s.prefill_step = self.prefill_step;
+                self.metrics.disk_load(secs);
+                eprintln!(
+                    "prewarmed {} tokens from disk in {secs:.2}s",
+                    s.tokens.len()
+                );
+                self.put(s);
+            }
+            Err(e) => eprintln!("could not prewarm: {e:#}"),
+        }
+        self.report_disk();
+    }
+
+    /// Saves every session in RAM, least recently used first so the most
+    /// recent one is the newest file (and the one prewarmed next time).
+    fn flush(&mut self) {
+        let mut entries = std::mem::take(&mut self.entries);
+        entries.sort_by_key(|(_, used)| *used);
+        for (s, _) in entries {
+            self.save_to_disk(&s);
         }
     }
 }
@@ -217,8 +310,22 @@ pub fn spawn(
                 }
             };
             metrics.set_active(mlx_rs::memory::active_memory().unwrap_or(0));
+            let manifest: std::collections::BTreeMap<String, String> = [
+                ("model".to_string(), config.model_id.clone()),
+                ("kv_bits".to_string(), config.kv.bits.to_string()),
+                ("kv_group".to_string(), config.kv.group_size.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            let disk = config.disk.as_ref().and_then(|(dir, budget)| {
+                DiskCache::open(dir, *budget, manifest.clone())
+                    .map_err(|e| eprintln!("disk cache disabled: {e:#}"))
+                    .ok()
+            });
             let mut cache = PrefixCache {
                 model: &model,
+                metrics: &metrics,
+                disk,
                 entries: Vec::new(),
                 clock: 0,
                 budget: config.cache_budget,
@@ -226,8 +333,8 @@ pub fn spawn(
                 prefill_step: config.prefill_step,
                 aligned: config.aligned_prefix,
             };
-            loop {
-                let job = queue.pop();
+            cache.prewarm();
+            while let Some(job) = queue.pop() {
                 metrics.set_queue(queue.len());
                 let (mut session, cached) = cache.take(&job.prompt);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -260,6 +367,8 @@ pub fn spawn(
                 metrics.set_cache(cache.entries.len(), cache.bytes());
                 metrics.set_active(mlx_rs::memory::active_memory().unwrap_or(0));
             }
+            // Shutting down: keep the conversations for the next start.
+            cache.flush();
         })
         .expect("spawning the model thread")
 }

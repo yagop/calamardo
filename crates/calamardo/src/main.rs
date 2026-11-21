@@ -71,6 +71,12 @@ enum Cmd {
         /// Reuse prefixes only at chunk boundaries (bit-exact output, less reuse).
         #[arg(long)]
         aligned_prefix: bool,
+        /// Directory of the prefix cache on disk.
+        #[arg(long, env = "CALAMARDO_DISK_CACHE_DIR")]
+        disk_cache_dir: Option<PathBuf>,
+        /// GB of SSD for saved conversations; 0 disables the disk cache.
+        #[arg(long, env = "CALAMARDO_DISK_CACHE_GB", default_value_t = 50.0)]
+        disk_cache_gb: f64,
     },
     /// KV cache quality: generates greedily with a bf16 cache, then replays
     /// the same tokens with each quantized format and reports the mean KL
@@ -142,7 +148,19 @@ fn main() -> Result<()> {
             default_reasoning_effort,
             cache_gb,
             aligned_prefix,
+            disk_cache_dir,
+            disk_cache_gb,
         } => {
+            let disk_cache = if disk_cache_gb > 0.0 {
+                let dir = match disk_cache_dir {
+                    Some(d) => d,
+                    None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                        .join(".cache/calamardo/sessions"),
+                };
+                Some((dir, (disk_cache_gb * 1e9) as u64))
+            } else {
+                None
+            };
             let cfg = calamardo_server::ServerConfig {
                 addr,
                 model_dir: dir,
@@ -156,6 +174,7 @@ fn main() -> Result<()> {
                 default_reasoning_effort,
                 cache_budget: (cache_gb * 1e9) as usize,
                 aligned_prefix,
+                disk_cache,
             };
             tokio::runtime::Runtime::new()?.block_on(calamardo_server::serve(cfg))
         }

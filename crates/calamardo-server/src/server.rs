@@ -63,6 +63,8 @@ pub struct ServerConfig {
     pub cache_budget: usize,
     /// Reuse prefixes only at chunk boundaries, for bit-exact output.
     pub aligned_prefix: bool,
+    /// Prefix cache on disk: directory and byte budget (None disables it).
+    pub disk_cache: Option<(PathBuf, u64)>,
 }
 
 struct App {
@@ -122,6 +124,12 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
             stop_tokens,
             cache_budget: cfg.cache_budget,
             aligned_prefix: cfg.aligned_prefix,
+            disk: cfg.disk_cache.clone(),
+            model_id: cfg
+                .model_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         },
         queue.clone(),
         metrics.clone(),
@@ -151,13 +159,20 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         .route("/v1/chat/completions", post(chat_completions))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(cors)
-        .with_state(app);
+        .with_state(app.clone());
+    let (queue_for_shutdown, app_for_shutdown) = (app.queue.clone(), app);
     eprintln!("listening on http://{addr}");
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    // Let the model thread finish and save its conversations to disk.
+    eprintln!("shutting down: saving conversations");
+    queue_for_shutdown.close();
+    while !app_for_shutdown.worker.is_finished() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     Ok(())
 }
 

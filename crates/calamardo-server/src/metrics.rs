@@ -14,6 +14,13 @@ pub struct Metrics {
     cached_tokens: AtomicU64,
     cache_sessions: AtomicU64,
     cache_bytes: AtomicU64,
+    disk_sessions: AtomicU64,
+    disk_bytes: AtomicU64,
+    disk_loads: AtomicU64,
+    disk_saves: AtomicU64,
+    /// f64 bits.
+    last_disk_load_seconds: AtomicU64,
+    last_disk_save_seconds: AtomicU64,
     completion_tokens: AtomicU64,
     /// f64 bits.
     prefill_seconds: AtomicU64,
@@ -56,6 +63,21 @@ impl Metrics {
 
     pub fn error(&self) {
         self.errors.fetch_add(1, Relaxed);
+    }
+
+    pub fn set_disk(&self, sessions: usize, bytes: usize) {
+        self.disk_sessions.store(sessions as u64, Relaxed);
+        self.disk_bytes.store(bytes as u64, Relaxed);
+    }
+
+    pub fn disk_load(&self, seconds: f64) {
+        self.disk_loads.fetch_add(1, Relaxed);
+        set_f64(&self.last_disk_load_seconds, seconds);
+    }
+
+    pub fn disk_save(&self, seconds: f64) {
+        self.disk_saves.fetch_add(1, Relaxed);
+        set_f64(&self.last_disk_save_seconds, seconds);
     }
 
     pub fn set_cache(&self, sessions: usize, bytes: usize) {
@@ -149,6 +171,42 @@ impl Metrics {
             "gauge",
             "Idle sessions in the prefix cache.",
             u(&self.cache_sessions).to_string(),
+        );
+        put(
+            "disk_cache_sessions",
+            "gauge",
+            "Conversations saved on disk.",
+            u(&self.disk_sessions).to_string(),
+        );
+        put(
+            "disk_cache_bytes",
+            "gauge",
+            "Bytes of the prefix cache on disk.",
+            u(&self.disk_bytes).to_string(),
+        );
+        put(
+            "disk_loads_total",
+            "counter",
+            "Conversations restored from disk.",
+            u(&self.disk_loads).to_string(),
+        );
+        put(
+            "disk_saves_total",
+            "counter",
+            "Conversations saved to disk.",
+            u(&self.disk_saves).to_string(),
+        );
+        put(
+            "last_disk_load_seconds",
+            "gauge",
+            "Time of the last restore from disk.",
+            f(&self.last_disk_load_seconds).to_string(),
+        );
+        put(
+            "last_disk_save_seconds",
+            "gauge",
+            "Time of the last save to disk.",
+            f(&self.last_disk_save_seconds).to_string(),
         );
         put(
             "prefix_cache_bytes",

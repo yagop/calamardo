@@ -528,3 +528,160 @@ impl PassSnapshot {
         }
     }
 }
+
+/// Arrays and scalar fields of a saved cache (safetensors data and metadata).
+#[derive(Default)]
+pub struct Saved {
+    pub arrays: Vec<(String, Array)>,
+    pub meta: std::collections::BTreeMap<String, String>,
+}
+
+/// Arrays of a loaded file, taken by name.
+pub struct Loaded {
+    pub arrays: std::collections::HashMap<String, Array>,
+    pub meta: std::collections::BTreeMap<String, String>,
+}
+
+impl Loaded {
+    pub fn array(&mut self, k: &str) -> Result<Array> {
+        self.arrays
+            .remove(k)
+            .with_context(|| format!("saved cache lacks {k}"))
+    }
+
+    pub fn opt(&mut self, k: &str) -> Option<Array> {
+        self.arrays.remove(k)
+    }
+
+    pub fn int(&self, k: &str) -> Result<i32> {
+        self.meta
+            .get(k)
+            .with_context(|| format!("saved cache lacks {k}"))?
+            .parse()
+            .with_context(|| format!("bad {k}"))
+    }
+}
+
+use anyhow::Context;
+
+fn export_conv(p: &str, conv: &[Option<Array>; 4], out: &mut Saved) {
+    for (i, c) in conv.iter().enumerate() {
+        if let Some(a) = c {
+            out.arrays.push((format!("{p}.conv{i}"), a.clone()));
+        }
+    }
+}
+
+fn import_conv(p: &str, l: &mut Loaded) -> [Option<Array>; 4] {
+    std::array::from_fn(|i| l.opt(&format!("{p}.conv{i}")))
+}
+
+fn export_packed(p: &str, x: &Packed, out: &mut Saved) {
+    out.arrays.push((format!("{p}.w"), x.w.clone()));
+    out.arrays.push((format!("{p}.scales"), x.scales.clone()));
+    out.arrays.push((format!("{p}.biases"), x.biases.clone()));
+}
+
+fn import_packed(p: &str, l: &mut Loaded) -> Result<Packed> {
+    Ok(Packed {
+        w: l.array(&format!("{p}.w"))?,
+        scales: l.array(&format!("{p}.scales"))?,
+        biases: l.array(&format!("{p}.biases"))?,
+    })
+}
+
+fn export_window(p: &str, c: &RotatingKvCache, out: &mut Saved) {
+    if let (Some(k), Some(v)) = (&c.keys, &c.values) {
+        out.arrays.push((format!("{p}.k"), k.clone()));
+        out.arrays.push((format!("{p}.v"), v.clone()));
+    }
+    out.meta.insert(format!("{p}.offset"), c.offset.to_string());
+    out.meta.insert(format!("{p}.idx"), c.idx.to_string());
+}
+
+fn import_window(p: &str, c: &mut RotatingKvCache, l: &mut Loaded) -> Result<()> {
+    c.keys = l.opt(&format!("{p}.k"));
+    c.values = l.opt(&format!("{p}.v"));
+    c.offset = l.int(&format!("{p}.offset"))?;
+    c.idx = l.int(&format!("{p}.idx"))?;
+    Ok(())
+}
+
+impl PassCache {
+    /// Adds this pass's state under prefix `p`. Buffers are saved whole (no
+    /// slicing copy); the offsets say how much is valid.
+    pub fn export(&self, p: &str, out: &mut Saved) {
+        match &self.attn {
+            AttnCache::Global(c) => {
+                if let (Some(k), Some(v)) = (&c.keys, &c.values) {
+                    out.arrays.push((format!("{p}.k"), k.clone()));
+                    out.arrays.push((format!("{p}.v"), v.clone()));
+                }
+                out.meta.insert(format!("{p}.offset"), c.offset.to_string());
+            }
+            AttnCache::Quantized(c) => {
+                if let (Some(k), Some(v)) = (&c.keys, &c.values) {
+                    export_packed(&format!("{p}.k"), k, out);
+                    export_packed(&format!("{p}.v"), v, out);
+                }
+                out.meta.insert(format!("{p}.offset"), c.offset.to_string());
+            }
+            AttnCache::Window(c) => export_window(p, c, out),
+        }
+        export_conv(p, &self.conv, out);
+    }
+
+    /// Fills this (fresh) pass cache from a saved one.
+    pub fn import(&mut self, p: &str, l: &mut Loaded) -> Result<()> {
+        match &mut self.attn {
+            AttnCache::Global(c) => {
+                c.keys = l.opt(&format!("{p}.k"));
+                c.values = l.opt(&format!("{p}.v"));
+                c.offset = l.int(&format!("{p}.offset"))?;
+            }
+            AttnCache::Quantized(c) => {
+                if l.arrays.contains_key(&format!("{p}.k.w")) {
+                    c.keys = Some(import_packed(&format!("{p}.k"), l)?);
+                    c.values = Some(import_packed(&format!("{p}.v"), l)?);
+                }
+                c.offset = l.int(&format!("{p}.offset"))?;
+            }
+            AttnCache::Window(c) => import_window(p, c, l)?,
+        }
+        self.conv = import_conv(p, l);
+        Ok(())
+    }
+}
+
+impl PassSnapshot {
+    pub fn export(&self, p: &str, out: &mut Saved) {
+        match self {
+            Self::Global { offset, conv } => {
+                out.meta.insert(format!("{p}.offset"), offset.to_string());
+                export_conv(p, conv, out);
+            }
+            Self::Window { cache, conv } => {
+                export_window(p, cache, out);
+                export_conv(p, conv, out);
+            }
+        }
+    }
+
+    /// Rebuilds a snapshot of the same kind as `like`.
+    pub fn import(like: &PassCache, p: &str, l: &mut Loaded) -> Result<Self> {
+        Ok(match &like.attn {
+            AttnCache::Window(c) => {
+                let mut cache = RotatingKvCache::new(c.max_size);
+                import_window(p, &mut cache, l)?;
+                Self::Window {
+                    cache,
+                    conv: import_conv(p, l),
+                }
+            }
+            _ => Self::Global {
+                offset: l.int(&format!("{p}.offset"))?,
+                conv: import_conv(p, l),
+            },
+        })
+    }
+}

@@ -287,7 +287,20 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - C-7: si una petición se cancela, la sesión se guarda con lo ya procesado y el reintento sigue desde ahí. C-8: el modelo no se descarga nunca.
 - `usage.prompt_tokens_details.cached_tokens` informa de lo reutilizado; `/metrics` añade `cached_tokens_total`, `prefix_cache_sessions` y `prefix_cache_bytes`.
 - Test con el modelo real: volver a la instantánea de fin de prompt y bifurcar desde ella reproducen exactamente los tokens greedy de una ejecución en frío, en bf16 y en 8 bits. En el servidor, con un prompt de 8k: el segundo turno reutiliza 8.224 de 8.235 tokens; un reintento idéntico, 8.234; el mismo turno con el razonamiento quitado del historial, 8.053 (instantánea del final del primer turno); volver a la primera rama, 8.434 (la bifurcación conservó la original).
-- Pendiente: C-9 (precalentar desde disco) y el nivel en disco, del Hito 6.
+- C-9 y el nivel en disco, en el Hito 6.
+
+**Hito 6: caché en disco (estado)**
+
+- C-3: cuando el presupuesto de RAM obliga a expulsar una conversación, se guarda en el SSD. Una petición que la continúa la recupera si el disco tiene más prefijo que la RAM; al cargarse, el archivo se borra (vuelve a disco cuando se expulse otra vez o al cerrar).
+- C-4: un safetensors por conversación, con nombre por hash de su ruta de tokens. Contiene los buffers de las cachés tal cual (sin copias para trocearlos), los tokens, la última instantánea de fin de prompt y un manifiesto en los metadatos: versión de formato, modelo (hash del snapshot), bits y grupo de la caché. Al arrancar se reconstruye el índice leyendo solo cabeceras y tokens; lo que no coincide con el manifiesto se borra. Se escribe a un temporal y se renombra, así un corte nunca deja un archivo a medias.
+- C-5: `--disk-cache-gb` (50 por defecto; 0 lo desactiva) y `--disk-cache-dir` (`~/.cache/calamardo/sessions`). Se expulsa primero lo usado hace más tiempo (fecha de modificación del archivo).
+- C-9: al cerrar con Ctrl-C se guardan en disco las conversaciones de RAM, y al arrancar se precarga la más reciente.
+- Tests con el modelo real: una sesión guardada y cargada sigue generando exactamente los mismos tokens que la original, y su instantánea de fin de prompt reproduce la ejecución en frío (bf16 y 4 bits); un manifiesto distinto se rechaza.
+- Medido en el servidor con 0,3 GB de RAM para la caché (cada conversación nueva expulsa la anterior):
+  - 8k tokens: guardar 0,12 s, restaurar 0,02 s; el turno siguiente reutiliza 8.093 de 8.102 tokens y responde en 1,6 s (10,6 s en frío). Tras Ctrl-C y rearranque, la conversación se precarga en 0,10 s y el siguiente turno reutiliza 8.141 tokens.
+  - 166.561 tokens: guardar 0,51 s, restaurar 0,10 s (objetivo ≤ 2 s); el turno siguiente reutiliza 166.590 de 166.598 tokens y tarda 2,4 s en total, frente a 317 s en frío. Ojo: el archivo se acababa de escribir y la lectura salió de la caché de páginas del sistema; la lectura en frío del SSD no está medida (requiere `sudo purge`), aunque unos 3,5 GB caben con holgura en 2 s a la velocidad del SSD del M4 Max.
+- `/metrics` añade `disk_cache_sessions`, `disk_cache_bytes`, `disk_loads_total`, `disk_saves_total` y los tiempos del último guardado y la última carga.
+- Pendiente: medir el desgaste del SSD con el uso diario (pregunta abierta).
 
 **Incoherencias a resolver**
 

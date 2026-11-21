@@ -614,3 +614,90 @@ pub fn eval(arrays: &[&Array]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Arrays by name and string metadata of a safetensors file.
+pub type Safetensors = (
+    Vec<(String, Array)>,
+    std::collections::BTreeMap<String, String>,
+);
+
+/// `mx.load(path, return_metadata=True)` of a safetensors file.
+pub fn load_safetensors_with_metadata(path: &std::path::Path) -> Result<Safetensors> {
+    let file = CString::new(path.to_string_lossy().as_bytes())?;
+    let mut out = Vec::new();
+    let mut meta = std::collections::BTreeMap::new();
+    // SAFETY: maps and iterators are created and freed here; keys and values
+    // are copied before the maps go away.
+    unsafe {
+        let cpu = sys::mlx_default_cpu_stream_new();
+        let mut arrays = sys::mlx_map_string_to_array_new();
+        let mut strings = sys::mlx_map_string_to_string_new();
+        let status = sys::mlx_load_safetensors(&mut arrays, &mut strings, file.as_ptr(), cpu);
+        sys::mlx_stream_free(cpu);
+        if status != 0 {
+            sys::mlx_map_string_to_array_free(arrays);
+            sys::mlx_map_string_to_string_free(strings);
+            bail!("loading {} failed: {}", path.display(), last_error());
+        }
+        let it = sys::mlx_map_string_to_array_iterator_new(arrays);
+        loop {
+            let mut key: *const c_char = std::ptr::null();
+            let mut value = sys::mlx_array_new();
+            if sys::mlx_map_string_to_array_iterator_next(&mut key, &mut value, it) != 0 {
+                sys::mlx_array_free(value);
+                break;
+            }
+            out.push((
+                CStr::from_ptr(key).to_string_lossy().into_owned(),
+                Array::from_ptr(value),
+            ));
+        }
+        sys::mlx_map_string_to_array_iterator_free(it);
+        sys::mlx_map_string_to_array_free(arrays);
+        let it = sys::mlx_map_string_to_string_iterator_new(strings);
+        loop {
+            let mut key: *const c_char = std::ptr::null();
+            let mut value: *const c_char = std::ptr::null();
+            if sys::mlx_map_string_to_string_iterator_next(&mut key, &mut value, it) != 0 {
+                break;
+            }
+            meta.insert(
+                CStr::from_ptr(key).to_string_lossy().into_owned(),
+                CStr::from_ptr(value).to_string_lossy().into_owned(),
+            );
+        }
+        sys::mlx_map_string_to_string_iterator_free(it);
+        sys::mlx_map_string_to_string_free(strings);
+    }
+    Ok((out, meta))
+}
+
+/// `mx.save_safetensors(path, arrays, metadata)`.
+pub fn save_safetensors(
+    path: &std::path::Path,
+    arrays: &[(String, Array)],
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let file = CString::new(path.to_string_lossy().as_bytes())?;
+    // SAFETY: the maps are created, filled with borrowed handles and C
+    // strings that outlive the call, and freed here.
+    unsafe {
+        let map = sys::mlx_map_string_to_array_new();
+        let meta = sys::mlx_map_string_to_string_new();
+        for (k, a) in arrays {
+            let k = CString::new(k.as_str())?;
+            sys::mlx_map_string_to_array_insert(map, k.as_ptr(), a.as_ptr());
+        }
+        for (k, v) in metadata {
+            let (k, v) = (CString::new(k.as_str())?, CString::new(v.as_str())?);
+            sys::mlx_map_string_to_string_insert(meta, k.as_ptr(), v.as_ptr());
+        }
+        let status = sys::mlx_save_safetensors(file.as_ptr(), map, meta);
+        sys::mlx_map_string_to_array_free(map);
+        sys::mlx_map_string_to_string_free(meta);
+        if status != 0 {
+            bail!("saving {} failed: {}", path.display(), last_error());
+        }
+    }
+    Ok(())
+}

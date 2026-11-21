@@ -436,3 +436,123 @@ impl Sampler {
         Ok(probs.last().map_or(0, |p| p.0))
     }
 }
+
+/// Version of the on-disk session format (C-4).
+pub const SAVE_FORMAT: &str = "calamardo-session-1";
+
+/// A saved session that does not match this model or cache format.
+#[derive(Debug)]
+pub struct Incompatible(pub String);
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "incompatible saved session: {}", self.0)
+    }
+}
+
+impl std::error::Error for Incompatible {}
+
+impl<'m> Session<'m> {
+    /// Saves the live state, the tokens and the latest prompt-end snapshot
+    /// as one safetensors file. `manifest` (model, cache format...) goes into
+    /// its metadata and must match on load. Writes to a temporary file first
+    /// so a crash never leaves half a file under `path`.
+    pub fn save(
+        &self,
+        path: &std::path::Path,
+        manifest: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        use crate::cache::Saved;
+        let mut out = Saved::default();
+        out.meta.extend(manifest.clone());
+        out.meta.insert("format".into(), SAVE_FORMAT.into());
+        out.arrays.push((
+            "tokens".into(),
+            Array::from_slice(&self.tokens, &[self.tokens.len() as i32]),
+        ));
+        for (i, c) in self.cache.iter().enumerate() {
+            c.export(&format!("live.{i}"), &mut out);
+        }
+        if let Some(s) = self.snapshots.iter().rev().find(|s| s.prompt_end) {
+            out.meta.insert("snap.len".into(), s.len.to_string());
+            for (i, p) in s.passes.iter().enumerate() {
+                p.export(&format!("snap.{i}"), &mut out);
+            }
+        }
+        // MLX appends ".safetensors" to names that lack it.
+        let tmp = path.with_extension("tmp.safetensors");
+        ops::save_safetensors(&tmp, &out.arrays, &out.meta)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Loads a session saved by `save`, checking `manifest` and the format.
+    pub fn load(
+        model: &'m Model,
+        kv: KvFormat,
+        path: &std::path::Path,
+        manifest: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Session<'m>> {
+        use crate::cache::{Loaded, PassSnapshot};
+        let (arrays, meta) = ops::load_safetensors_with_metadata(path)?;
+        if meta.get("format").map(String::as_str) != Some(SAVE_FORMAT) {
+            return Err(Incompatible(format!("format {:?}", meta.get("format"))).into());
+        }
+        for (k, v) in manifest {
+            if meta.get(k) != Some(v) {
+                return Err(
+                    Incompatible(format!("{k} is {:?}, expected {v:?}", meta.get(k))).into(),
+                );
+            }
+        }
+        let mut l = Loaded {
+            arrays: arrays.into_iter().collect(),
+            meta,
+        };
+        let mut s = Session::new(model, kv);
+        let tokens = l.array("tokens")?;
+        ops::eval(&[&tokens])?;
+        s.tokens = tokens.as_slice::<u32>().to_vec();
+        for (i, c) in s.cache.iter_mut().enumerate() {
+            c.import(&format!("live.{i}"), &mut l)?;
+        }
+        if let Some(len) = l.meta.get("snap.len").and_then(|v| v.parse::<usize>().ok()) {
+            let passes = s
+                .cache
+                .iter()
+                .enumerate()
+                .map(|(i, c)| PassSnapshot::import(c, &format!("snap.{i}"), &mut l))
+                .collect::<Result<Vec<_>>>()?;
+            s.snapshots.push(Snapshot {
+                len,
+                prompt_end: true,
+                passes,
+            });
+        }
+        // Read everything now, not on the first request that touches it.
+        let mut all: Vec<&Array> = s.cache.iter().flat_map(|c| c.arrays()).collect();
+        let snap_arrays: Vec<Array> = s.snapshots.iter().flat_map(|sn| sn.arrays()).collect();
+        all.extend(snap_arrays.iter());
+        ops::eval(&all)?;
+        Ok(s)
+    }
+}
+
+impl Snapshot {
+    fn arrays(&self) -> Vec<Array> {
+        self.passes
+            .iter()
+            .flat_map(|p| match p {
+                crate::cache::PassSnapshot::Global { conv, .. } => {
+                    conv.iter().flatten().cloned().collect::<Vec<_>>()
+                }
+                crate::cache::PassSnapshot::Window { cache, conv } => cache
+                    .arrays()
+                    .into_iter()
+                    .cloned()
+                    .chain(conv.iter().flatten().cloned())
+                    .collect(),
+            })
+            .collect()
+    }
+}
