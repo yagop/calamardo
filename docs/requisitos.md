@@ -264,6 +264,20 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
   - Decode a 166k: 26,6 tok/s sin drafter. Encuentra la aguja.
 - Calidad a 166k (`kv-eval`, 128 tokens forzados desde bf16): KL media 0,0026 con 8 bits (126/128 en top-1) y 0,0102 con 4 bits (125/128). A 8k eran 0,0044 y 0,0076: 8 bits no empeora con el contexto y 4 bits sí, alrededor de 4 veces la divergencia de 8 bits a 160k. Responde la pregunta abierta: 4 bits funciona, pero la recomendación sigue siendo 8 bits y 4 bits queda como opción para contextos que no caben de otra forma.
 
+**Hito 4: servidor (estado)**
+
+- `calamardo serve` (axum). Por defecto escucha en `127.0.0.1:11434` (`--addr` / `CALAMARDO_ADDR`; `0.0.0.0:…` para la red local), con caché de 8 bits, sin API key (`CALAMARDO_API_KEY` la activa como `Authorization: Bearer`) y sin conexiones salientes.
+- Endpoints: `POST /v1/chat/completions` (con y sin streaming), `GET /v1/models`, `GET /health` y `GET /metrics` (Prometheus). Se acepta cualquier nombre de modelo en las peticiones, así que los clientes que piden `inkling-2-mini:26b-a5b-nvfp4` funcionan sin cambios.
+- M-8 y M-9: la plantilla oficial se renderiza con minijinja y da exactamente el mismo texto que `apply_chat_template` de transformers (test con 5 conversaciones: sistema, historial con razonamiento, herramientas con llamada y resultado, contenido por partes, esfuerzo numérico). `reasoning_effort` (o `reasoning.effort`) pasa a la plantilla; sin él, la plantilla usa 0.9 (`--default-reasoning-effort` lo cambia).
+- M-10: el parser sigue el `response_template` del checkpoint, por ids de tokens especiales. El razonamiento sale en `reasoning`, el campo de Ollama; en el historial se acepta `reasoning` o `reasoning_content`. Las llamadas a herramientas salen en `tool_calls`, con `finish_reason: "tool_calls"`, y los argumentos como cadena JSON; los que llegan como cadena en el historial se convierten en objeto para la plantilla.
+- Muestreo: `temperature` (0 = greedy en GPU, el mismo camino que la verificación), `top_p`, `seed`, `max_tokens`/`max_completion_tokens` (por defecto 32.768) y `stop`. Las secuencias de parada se aplican al contenido; si una llega partida entre tokens, la parte anterior puede haberse enviado ya.
+- `tool_choice`: solo se respeta `"none"`; `"required"` o una función concreta no se fuerzan (haría falta decodificación restringida).
+- Requisito 1: `usage` incluye `prompt_tokens_details.cached_tokens`, a 0 hasta la caché de prefijos (Hito 5).
+- Requisitos 5 y 6: si el cliente corta, la generación se para en el siguiente token (probado: 89 de 2.000 tokens tras cortar a los 3 s). Conservar el prefill hecho (C-7) es del Hito 5. Durante el prefill, el stream manda un comentario SSE por trozo (`: prefill 2048/166561`), y cada 15 s otro de keep-alive.
+- Requisito 7: un solo slot en un hilo dueño del modelo. Las peticiones esperan en una cola de `--queue` (8); con la cola llena devuelven 429 al instante, y tras `--max-queue-wait` (900 s) de espera, también 429 (probado).
+- K-9: `/metrics` expone el pico de memoria de cada paso de prefill (máximo histórico y de la última petición), el transitorio por encima de lo activo, la memoria activa, velocidades, tokens, cola y rechazos.
+- Pendiente: los endpoints deseables (`/v1/completions`, `/v1/responses`, `/v1/messages`, `/api/*` de Ollama) y la verificación 7 (una semana con el cliente de 192.168.0.171).
+
 **Incoherencias a resolver**
 
 1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k. Resuelto en la práctica: Calamardo hace 401 tok/s a 145k y 5,3 min en frío.

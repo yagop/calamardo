@@ -1,0 +1,19 @@
+[package]
+name = "calamardo-server"
+description = "OpenAI-compatible HTTP server for Calamardo"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+calamardo-model.workspace = true
+mlx-rs.workspace = true
+mlx-sys.workspace = true
+minijinja = { version = "3.1", default-features = false, features = ["builtins", "macros", "json", "serde", "preserve_order", "loop_controls", "std_collections"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal", "time"] }
+tokio-stream = "0.1"

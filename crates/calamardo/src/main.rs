@@ -35,6 +35,37 @@ enum Cmd {
         #[arg(long, env = "CALAMARDO_KV_BITS", default_value_t = 8)]
         kv_bits: usize,
     },
+    /// OpenAI-compatible HTTP server (one slot).
+    Serve {
+        /// Address to listen on; 0.0.0.0 to serve the local network.
+        #[arg(long, env = "CALAMARDO_ADDR", default_value = "127.0.0.1:11434")]
+        addr: std::net::SocketAddr,
+        /// Bits of the global passes' KV cache: 16, 8 or 4.
+        #[arg(long, env = "CALAMARDO_KV_BITS", default_value_t = 8)]
+        kv_bits: i32,
+        #[arg(long, env = "CALAMARDO_KV_GROUP", default_value_t = 64)]
+        kv_group: i32,
+        #[arg(long, default_value_t = calamardo_model::generate::PREFILL_STEP)]
+        prefill_step: usize,
+        /// Model id reported by /v1/models (requests may name any).
+        #[arg(long, default_value = "inkling-2-mini")]
+        model_name: String,
+        /// Requests that may wait for the slot; more get 429 at once.
+        #[arg(long, default_value_t = 8)]
+        queue: usize,
+        /// Seconds a request may wait for the slot before 429.
+        #[arg(long, default_value_t = 900)]
+        max_queue_wait: u64,
+        /// Bearer token required on /v1 routes (none by default).
+        #[arg(long, env = "CALAMARDO_API_KEY", hide_env_values = true)]
+        api_key: Option<String>,
+        /// max_tokens for requests that give none.
+        #[arg(long, default_value_t = 32768)]
+        default_max_tokens: usize,
+        /// reasoning_effort for requests that give none (template default: high).
+        #[arg(long)]
+        default_reasoning_effort: Option<String>,
+    },
     /// KV cache quality: generates greedily with a bf16 cache, then replays
     /// the same tokens with each quantized format and reports the mean KL
     /// divergence and top-1 agreement against bf16 (verification 2).
@@ -92,6 +123,32 @@ fn main() -> Result<()> {
     };
     match cli.cmd {
         Cmd::Inspect { kv_bits } => inspect(&Checkpoint::open(&dir)?, kv_bits),
+        Cmd::Serve {
+            addr,
+            kv_bits,
+            kv_group,
+            prefill_step,
+            model_name,
+            queue,
+            max_queue_wait,
+            api_key,
+            default_max_tokens,
+            default_reasoning_effort,
+        } => {
+            let cfg = calamardo_server::ServerConfig {
+                addr,
+                model_dir: dir,
+                kv: calamardo_model::cache::KvFormat::new(kv_bits, kv_group)?,
+                prefill_step,
+                model_name,
+                queue,
+                max_queue_wait: std::time::Duration::from_secs(max_queue_wait),
+                api_key,
+                default_max_tokens,
+                default_reasoning_effort,
+            };
+            tokio::runtime::Runtime::new()?.block_on(calamardo_server::serve(cfg))
+        }
         Cmd::KvEval {
             prompt_file,
             tokens,

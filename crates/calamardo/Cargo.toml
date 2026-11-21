@@ -10,6 +10,8 @@ anyhow.workspace = true
 clap.workspace = true
 calamardo-ckpt.workspace = true
 calamardo-model.workspace = true
+calamardo-server.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
 tokenizers.workspace = true
 mlx-rs.workspace = true
 mlx-sys.workspace = true

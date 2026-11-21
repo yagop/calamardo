@@ -151,3 +151,149 @@ pub fn greedy(
     }
     Ok(out)
 }
+
+/// Generation was cancelled (client gone, stop sequence...).
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// A conversation's caches plus the tokens they hold. `feed` follows the
+/// same schedule as `greedy`, so feeding a prompt and then one token at a
+/// time reproduces it.
+pub struct Session<'m> {
+    model: &'m Model,
+    cache: Vec<PassCache>,
+    /// Every token fed so far, in order.
+    pub tokens: Vec<u32>,
+    pub prefill_step: usize,
+}
+
+impl<'m> Session<'m> {
+    pub fn new(model: &'m Model, kv: KvFormat) -> Self {
+        Self {
+            model,
+            cache: model.make_cache(kv),
+            tokens: Vec::new(),
+            prefill_step: PREFILL_STEP,
+        }
+    }
+
+    /// Feeds `tokens` and returns the log-probabilities (1, V) of the next
+    /// one. All but the last token go through the chunked prefill; the
+    /// last through a single-token step. Checks `cancel` between chunks.
+    pub fn feed(
+        &mut self,
+        tokens: &[u32],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_chunk: &mut dyn FnMut(PrefillChunk),
+    ) -> Result<Array> {
+        use std::sync::atomic::Ordering;
+        anyhow::ensure!(!tokens.is_empty(), "nothing to feed");
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let mut done = 0;
+        while ids.len() - done > 1 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Cancelled.into());
+            }
+            let n = self.prefill_step.min(ids.len() - done - 1);
+            let t = std::time::Instant::now();
+            mlx_rs::memory::reset_peak_memory()?;
+            let chunk = Array::from_slice(&ids[done..done + n], &[1, n as i32]);
+            self.model.forward(&chunk, &mut self.cache)?;
+            eval_cache(&self.cache)?;
+            let peak_bytes = mlx_rs::memory::peak_memory()?;
+            self.tokens.extend_from_slice(&tokens[done..done + n]);
+            done += n;
+            ops::clear_cache();
+            on_chunk(PrefillChunk {
+                done,
+                total: ids.len(),
+                tokens: n,
+                seconds: t.elapsed().as_secs_f64(),
+                active_bytes: mlx_rs::memory::active_memory()?,
+                peak_bytes,
+            });
+        }
+        let last = Array::from_slice(&ids[done..], &[(ids.len() - done) as i32]);
+        let lp = step_logprobs(self.model, &last, &mut self.cache)?;
+        self.tokens.extend_from_slice(&tokens[done..]);
+        Ok(lp)
+    }
+}
+
+/// Picks the next token from log-probabilities (1, V).
+pub struct Sampler {
+    pub temperature: f32,
+    pub top_p: f32,
+    rng: u64,
+}
+
+impl Sampler {
+    pub fn new(temperature: f32, top_p: f32, seed: u64) -> Self {
+        Self {
+            temperature,
+            top_p,
+            // splitmix64 never sees a zero state.
+            rng: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    pub fn sample(&mut self, logprobs: &Array) -> Result<u32> {
+        if self.temperature <= 0.0 {
+            // Greedy on the GPU, exactly as `greedy` does.
+            let y = ops::astype(&ops::argmax(logprobs, -1)?, Dtype::Uint32)?;
+            ops::eval(&[&y])?;
+            return Ok(y.item_exact::<u32>());
+        }
+        let lp = ops::f32(logprobs)?;
+        ops::eval(&[&lp])?;
+        let lp = lp.as_slice::<f32>();
+        let t = self.temperature as f64;
+        let max = lp.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let mut probs: Vec<(u32, f64)> = lp
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (i as u32, ((x as f64 - max) / t).exp()))
+            .filter(|&(_, p)| p > 0.0)
+            .collect();
+        let z: f64 = probs.iter().map(|p| p.1).sum();
+        if self.top_p < 1.0 {
+            probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            let mut acc = 0.0;
+            let mut keep = probs.len();
+            for (i, p) in probs.iter().enumerate() {
+                acc += p.1 / z;
+                if acc >= self.top_p as f64 {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(keep);
+        }
+        let total: f64 = probs.iter().map(|p| p.1).sum();
+        let mut r = self.next_f64() * total;
+        for &(id, p) in &probs {
+            r -= p;
+            if r <= 0.0 {
+                return Ok(id);
+            }
+        }
+        Ok(probs.last().map_or(0, |p| p.0))
+    }
+}

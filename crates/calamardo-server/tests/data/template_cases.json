@@ -1,0 +1,126 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola, ¿qué tal?"
+   }
+  ],
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hola, ¿qué tal?<|end_message|>"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Eres un asistente conciso."
+   },
+   {
+    "role": "user",
+    "content": "Explain rust lifetimes."
+   }
+  ],
+  "reasoning_effort": "none",
+  "expected": "<|message_system|><|content_text|>Eres un asistente conciso.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Explain rust lifetimes.<|end_message|>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Simple sum.",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "¿Y 3+3?"
+   }
+  ],
+  "reasoning_effort": "low",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>Simple sum.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>¿Y 3+3?<|end_message|>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Vigo?"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "unit": "c",
+        "city": "Vigo \"centro\""
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp\": 17, \"sky\": \"nublado\"}"
+   },
+   {
+    "role": "user",
+    "content": "Thanks!"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "medium",
+  "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Weather in Vigo?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Vigo \\\"centro\\\"\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 17, \"sky\": \"nublado\"}<|end_message|><|message_user|><|content_text|>Thanks!<|end_message|>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Part one."
+     },
+     {
+      "type": "text",
+      "text": "Part two."
+     }
+    ]
+   }
+  ],
+  "reasoning_effort": 0.5,
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Part one.<|end_message|><|message_user|><|content_text|>Part two.<|end_message|>"
+ }
+]
