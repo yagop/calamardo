@@ -1,0 +1,25 @@
+[package]
+# Drop-in replacement for crates.io `mlx-sys` 0.7.0, wired in through
+# `[patch.crates-io]` so `mlx-rs` builds on top of it. Instead of building MLX
+# from source with CMake (which needs the Metal compiler, i.e. Xcode), it
+# compiles only MLX-C with `cc` and links the official prebuilt libmlx.dylib
+# from the `mlx-metal` wheel (see scripts/fetch-mlx.sh).
+name = "mlx-sys"
+version = "0.7.0"
+edition = "2021"
+links = "mlx"
+description = "MLX-C bindings linked against the prebuilt MLX from the mlx-metal wheel"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+# Kept so `mlx-rs` feature flags resolve. MLX is prebuilt with Metal and
+# Accelerate, so they do not change the build.
+default = ["accelerate", "metal"]
+accelerate = []
+metal = []
+metal-jit = ["metal"]
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = { version = "1", features = ["parallel"] }

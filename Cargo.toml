@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/calamardo", "crates/calamardo-ckpt", "crates/mlx-sys"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+calamardo-ckpt = { path = "crates/calamardo-ckpt" }
+mlx-rs = { version = "=0.34.0", default-features = false, features = ["metal", "accelerate"] }
+mlx-sys = { version = "=0.7.0", default-features = false }
+
+[profile.release]
+debug = "line-tables-only"
+
+# Our mlx-sys links the prebuilt MLX instead of building it with CMake.
+[patch.crates-io]
+mlx-sys = { path = "crates/mlx-sys" }

@@ -1,0 +1,13 @@
+[package]
+name = "calamardo"
+description = "Inkling 2 Mini runtime on MLX"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+calamardo-ckpt.workspace = true
+mlx-rs.workspace = true
+mlx-sys.workspace = true
