@@ -65,6 +65,12 @@ enum Cmd {
         /// reasoning_effort for requests that give none (template default: high).
         #[arg(long)]
         default_reasoning_effort: Option<String>,
+        /// GB of RAM the prefix cache may hold (idle sessions and snapshots).
+        #[arg(long, env = "CALAMARDO_CACHE_GB", default_value_t = 16.0)]
+        cache_gb: f64,
+        /// Reuse prefixes only at chunk boundaries (bit-exact output, less reuse).
+        #[arg(long)]
+        aligned_prefix: bool,
     },
     /// KV cache quality: generates greedily with a bf16 cache, then replays
     /// the same tokens with each quantized format and reports the mean KL
@@ -134,6 +140,8 @@ fn main() -> Result<()> {
             api_key,
             default_max_tokens,
             default_reasoning_effort,
+            cache_gb,
+            aligned_prefix,
         } => {
             let cfg = calamardo_server::ServerConfig {
                 addr,
@@ -146,6 +154,8 @@ fn main() -> Result<()> {
                 api_key,
                 default_max_tokens,
                 default_reasoning_effort,
+                cache_budget: (cache_gb * 1e9) as usize,
+                aligned_prefix,
             };
             tokio::runtime::Runtime::new()?.block_on(calamardo_server::serve(cfg))
         }

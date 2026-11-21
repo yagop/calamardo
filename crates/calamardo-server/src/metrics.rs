@@ -11,6 +11,9 @@ pub struct Metrics {
     rejected: AtomicU64,
     errors: AtomicU64,
     prompt_tokens: AtomicU64,
+    cached_tokens: AtomicU64,
+    cache_sessions: AtomicU64,
+    cache_bytes: AtomicU64,
     completion_tokens: AtomicU64,
     /// f64 bits.
     prefill_seconds: AtomicU64,
@@ -38,14 +41,13 @@ fn set_f64(a: &AtomicU64, v: f64) {
 }
 
 impl Metrics {
-    pub fn enqueued(&self) {
-        self.queued.fetch_add(1, Relaxed);
+    pub fn set_queue(&self, len: usize) {
+        self.queued.store(len as u64, Relaxed);
     }
 
-    pub fn dequeued(&self) {
-        let _ = self
-            .queued
-            .try_update(Relaxed, Relaxed, |q| Some(q.saturating_sub(1)));
+    /// The slot is free again, however the job ended.
+    pub fn job_finished(&self) {
+        self.busy.store(0, Relaxed);
     }
 
     pub fn rejected(&self) {
@@ -56,8 +58,14 @@ impl Metrics {
         self.errors.fetch_add(1, Relaxed);
     }
 
-    pub fn request_started(&self) {
+    pub fn set_cache(&self, sessions: usize, bytes: usize) {
+        self.cache_sessions.store(sessions as u64, Relaxed);
+        self.cache_bytes.store(bytes as u64, Relaxed);
+    }
+
+    pub fn request_started(&self, cached: usize) {
         self.requests.fetch_add(1, Relaxed);
+        self.cached_tokens.fetch_add(cached as u64, Relaxed);
         self.busy.store(1, Relaxed);
         self.last_prefill_peak_bytes.store(0, Relaxed);
         self.last_prefill_transient_bytes.store(0, Relaxed);
@@ -91,7 +99,6 @@ impl Metrics {
                 (tokens - 1) as f64 / seconds.max(1e-9),
             );
         }
-        self.busy.store(0, Relaxed);
     }
 
     pub fn render(&self) -> String {
@@ -130,6 +137,24 @@ impl Metrics {
             "counter",
             "Tokens generated.",
             u(&self.completion_tokens).to_string(),
+        );
+        put(
+            "cached_tokens_total",
+            "counter",
+            "Prompt tokens served from the prefix cache.",
+            u(&self.cached_tokens).to_string(),
+        );
+        put(
+            "prefix_cache_sessions",
+            "gauge",
+            "Idle sessions in the prefix cache.",
+            u(&self.cache_sessions).to_string(),
+        );
+        put(
+            "prefix_cache_bytes",
+            "gauge",
+            "Memory held by the prefix cache (upper bound).",
+            u(&self.cache_bytes).to_string(),
         );
         put(
             "prefill_seconds_total",

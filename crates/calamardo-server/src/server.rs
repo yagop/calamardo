@@ -8,7 +8,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, TrySendError},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,8 +15,9 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode, header},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -29,13 +29,17 @@ use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::{
     metrics::Metrics,
     parser::{Delta, ResponseParser, Specials},
     template::ChatTemplate,
-    worker::{self, Event, Finish, Job, WorkerConfig},
+    worker::{self, Event, Finish, Job, Queue, WorkerConfig},
 };
+
+/// Largest request body (long agent contexts, images in content parts).
+const MAX_BODY: usize = 256 << 20;
 
 pub struct ServerConfig {
     pub addr: SocketAddr,
@@ -55,6 +59,10 @@ pub struct ServerConfig {
     /// reasoning_effort when the request gives none; `None` keeps the
     /// template's default (0.9).
     pub default_reasoning_effort: Option<String>,
+    /// Bytes the prefix cache may keep in RAM.
+    pub cache_budget: usize,
+    /// Reuse prefixes only at chunk boundaries, for bit-exact output.
+    pub aligned_prefix: bool,
 }
 
 struct App {
@@ -62,11 +70,29 @@ struct App {
     tokenizer: Tokenizer,
     template: ChatTemplate,
     specials: Specials,
-    jobs: mpsc::SyncSender<Job>,
+    queue: Arc<Queue>,
     metrics: Arc<Metrics>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+/// Browser clients on this machine only, as Ollama allows by default.
+fn local_origin(origin: &HeaderValue, _: &Parts) -> bool {
+    let Ok(o) = origin.to_str() else {
+        return false;
+    };
+    let host = o
+        .strip_prefix("http://")
+        .or_else(|| o.strip_prefix("https://"))
+        .unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
+    // Bind first: a busy port fails now, not after loading the model.
+    let listener = tokio::net::TcpListener::bind(cfg.addr)
+        .await
+        .with_context(|| format!("listening on {}", cfg.addr))?;
     let tokenizer = Tokenizer::from_file(cfg.model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
     let template = ChatTemplate::load(&cfg.model_dir.join("chat_template.jinja"))?;
@@ -75,18 +101,29 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let eos = config["eos_token_id"]
         .as_u64()
         .context("config.json has no eos_token_id")? as u32;
+    let mut stop_tokens = vec![eos];
+    for t in [
+        "<|endoftext|>",
+        "<|message_user|>",
+        "<|message_system|>",
+        "<|message_tool|>",
+    ] {
+        stop_tokens.extend(tokenizer.token_to_id(t));
+    }
 
     let metrics = Arc::new(Metrics::default());
-    let (tx, rx) = mpsc::sync_channel(cfg.queue);
+    let queue = Arc::new(Queue::new(cfg.queue));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    worker::spawn(
+    let worker = worker::spawn(
         WorkerConfig {
             model_dir: cfg.model_dir.clone(),
             kv: cfg.kv,
             prefill_step: cfg.prefill_step,
-            eos,
+            stop_tokens,
+            cache_budget: cfg.cache_budget,
+            aligned_prefix: cfg.aligned_prefix,
         },
-        rx,
+        queue.clone(),
         metrics.clone(),
         ready_tx,
     );
@@ -98,16 +135,23 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         tokenizer,
         template,
         specials,
-        jobs: tx,
+        queue,
         metrics,
+        worker,
     });
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(local_origin))
+        .allow_methods(Any)
+        .allow_headers(Any);
     let router = Router::new()
-        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/health", get(health))
         .route("/metrics", get(metrics_route))
         .route("/v1/models", get(models))
+        .route("/v1/models/{id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(cors)
         .with_state(app);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("listening on http://{addr}");
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
@@ -126,11 +170,31 @@ fn authorized(app: &App, headers: &HeaderMap) -> bool {
     let Some(key) = &app.cfg.api_key else {
         return true;
     };
-    headers
+    let Some(v) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|v| v == key)
+    else {
+        return false;
+    };
+    // The scheme is case-insensitive (RFC 7235); compare in constant time.
+    let given = match v.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim().as_bytes(),
+        _ => return false,
+    };
+    let key = key.as_bytes();
+    given.len() == key.len() && given.iter().zip(key).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+async fn health(State(app): State<Arc<App>>) -> Response {
+    if app.worker.is_finished() {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "the model thread is not running",
+        )
+    } else {
+        Json(json!({"status": "ok"})).into_response()
+    }
 }
 
 async fn metrics_route(State(app): State<Arc<App>>) -> impl IntoResponse {
@@ -154,11 +218,29 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             "invalid API key",
         );
     }
-    Json(json!({
-        "object": "list",
-        "data": [{"id": app.cfg.model_name, "object": "model", "created": now(), "owned_by": "calamardo"}],
-    }))
-    .into_response()
+    Json(json!({"object": "list", "data": [model_json(&app)]})).into_response()
+}
+
+fn model_json(app: &App) -> Value {
+    json!({"id": app.cfg.model_name, "object": "model", "created": now(), "owned_by": "calamardo"})
+}
+
+/// `GET /v1/models/{id}`: every name maps to the one model.
+async fn model(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !authorized(&app, &headers) {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid API key",
+        );
+    }
+    let mut m = model_json(&app);
+    m["id"] = json!(id);
+    Json(m).into_response()
 }
 
 /// A parsed request, ready for the model.
@@ -174,14 +256,18 @@ struct Request {
     include_usage: bool,
 }
 
-/// OpenAI messages into what the template expects: tool call arguments as
-/// objects, and `reasoning` (Ollama, newer vLLM) as `reasoning_content`.
-fn normalize_messages(messages: &Value) -> Result<Value, String> {
+/// OpenAI messages into what the template expects: `developer` as `system`,
+/// tool call arguments as objects, and `reasoning` (Ollama, newer vLLM) as
+/// `reasoning_content`.
+fn normalize_messages(messages: &Value) -> Result<Vec<Value>, String> {
     let list = messages.as_array().ok_or("messages must be an array")?;
     let mut out = Vec::with_capacity(list.len());
     for m in list {
         let mut m = m.clone();
         let obj = m.as_object_mut().ok_or("each message must be an object")?;
+        if obj.get("role").and_then(|r| r.as_str()) == Some("developer") {
+            obj.insert("role".into(), json!("system"));
+        }
         if !obj.contains_key("reasoning_content")
             && let Some(r) = obj.remove("reasoning")
         {
@@ -192,22 +278,53 @@ fn normalize_messages(messages: &Value) -> Result<Value, String> {
                 if let Some(args) = c.pointer_mut("/function/arguments")
                     && let Value::String(s) = args
                 {
-                    *args = if s.trim().is_empty() {
-                        json!({})
-                    } else {
-                        serde_json::from_str(s)
-                            .map_err(|e| format!("tool call arguments are not JSON: {e}"))?
+                    // Arguments that are not a JSON object (a broken call the
+                    // client kept) become empty rather than failing every
+                    // later turn of the conversation.
+                    *args = match serde_json::from_str::<Value>(s) {
+                        Ok(v @ Value::Object(_)) => v,
+                        _ => json!({}),
                     };
                 }
             }
         }
         out.push(m);
     }
-    Ok(Value::Array(out))
+    Ok(out)
+}
+
+/// `response_format` as an instruction: the output is not constrained, so a
+/// client should still validate it.
+fn format_instruction(body: &Value) -> Option<String> {
+    match body
+        .pointer("/response_format/type")
+        .and_then(|t| t.as_str())?
+    {
+        "json_object" => {
+            Some("Respond only with a valid JSON object, without any other text.".into())
+        }
+        "json_schema" => {
+            let schema = body
+                .pointer("/response_format/json_schema/schema")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Some(format!(
+                "Respond only with a valid JSON object that matches this JSON schema, without any other text: {schema}"
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
-    let messages = normalize_messages(body.get("messages").ok_or("missing messages")?)?;
+    if body.get("logprobs").and_then(|v| v.as_bool()) == Some(true) {
+        return Err("logprobs are not supported".into());
+    }
+    let mut messages = normalize_messages(body.get("messages").ok_or("missing messages")?)?;
+    if let Some(instruction) = format_instruction(body) {
+        messages.insert(0, json!({"role": "system", "content": instruction}));
+    }
+    let messages = Value::Array(messages);
     let tool_choice_none = body.get("tool_choice").and_then(|v| v.as_str()) == Some("none");
     let tools = body.get("tools").filter(|t| {
         !t.is_null() && !tool_choice_none && t.as_array().is_none_or(|a| !a.is_empty())
@@ -232,7 +349,7 @@ fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
     let max_tokens = body
         .get("max_completion_tokens")
         .or_else(|| body.get("max_tokens"))
-        .and_then(|v| v.as_u64())
+        .and_then(|v| v.as_f64())
         .map_or(app.cfg.default_max_tokens, |v| v as usize);
     let stop = match body.get("stop") {
         Some(Value::String(s)) => vec![s.clone()],
@@ -241,17 +358,17 @@ fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
             .filter_map(|s| s.as_str().map(String::from))
             .collect(),
         _ => Vec::new(),
-    };
+    }
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seed = body
-        .get("seed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64)
-                ^ COUNTER.fetch_add(1, Ordering::Relaxed)
-        });
+    let seed = num("seed").map(|v| v as u64).unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+            ^ COUNTER.fetch_add(1, Ordering::Relaxed)
+    });
     Ok(Request {
         model: body
             .get("model")
@@ -311,9 +428,12 @@ impl Collector {
                         .stops
                         .iter()
                         .filter_map(|stop| {
-                            self.content[start.saturating_sub(stop.len())..]
-                                .find(stop.as_str())
-                                .map(|i| i + start.saturating_sub(stop.len()))
+                            // A stop may begin in earlier text; search from a
+                            // char boundary before the new text.
+                            let from = self
+                                .content
+                                .floor_char_boundary(start.saturating_sub(stop.len()));
+                            self.content[from..].find(stop.as_str()).map(|i| i + from)
                         })
                         .min();
                     if let Some(cut) = hit {
@@ -373,19 +493,19 @@ fn tool_call_json(i: usize, id: &str, name: &str, arguments: &str) -> Value {
     json!({"index": i, "id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
 }
 
-fn usage(prompt: usize, completion: usize) -> Value {
+fn usage(prompt: usize, cached: usize, completion: usize) -> Value {
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
-        "prompt_tokens_details": {"cached_tokens": 0},
+        "prompt_tokens_details": {"cached_tokens": cached},
     })
 }
 
 async fn chat_completions(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Response {
     if !authorized(&app, &headers) {
         return error(
@@ -394,9 +514,48 @@ async fn chat_completions(
             "invalid API key",
         );
     }
-    let req = match parse_request(&app, &body) {
-        Ok(r) => r,
-        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    if app.worker.is_finished() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "the model thread is not running",
+        );
+    }
+    // Cheap check before tokenizing a long prompt for nothing.
+    if app.queue.is_full() {
+        app.metrics.rejected();
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "the model is busy and the queue is full",
+        );
+    }
+    // Any Content-Type, as Ollama; JSON errors in the OpenAI shape.
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("invalid JSON: {e}"),
+            );
+        }
+    };
+    // Rendering and tokenizing a long prompt is CPU work: off the async threads.
+    let parsed = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || parse_request(&app, &body)).await
+    };
+    let req = match parsed {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                e.to_string(),
+            );
+        }
     };
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -410,30 +569,18 @@ async fn chat_completions(
         cancel: cancel.clone(),
         events: etx,
     };
-    app.metrics.enqueued();
-    match app.jobs.try_send(job) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            app.metrics.dequeued();
-            app.metrics.rejected();
-            return error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                "the model is busy and the queue is full",
-            );
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            app.metrics.dequeued();
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "the model thread is not running",
-            );
-        }
+    if app.queue.push(job).is_err() {
+        app.metrics.rejected();
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "the model is busy and the queue is full",
+        );
     }
+    app.metrics.set_queue(app.queue.len());
     // Wait for the slot.
     match tokio::time::timeout(app.cfg.max_queue_wait, erx.recv()).await {
-        Ok(Some(Event::Started)) => {}
+        Ok(Some(Event::Started { .. })) => {}
         Ok(Some(Event::Error(e))) => {
             app.metrics.error();
             return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e);
@@ -469,9 +616,11 @@ async fn full_response(
     cancel: Arc<AtomicBool>,
     mut erx: UnboundedReceiver<Event>,
 ) -> Response {
+    let id = completion_id();
     let mut c = Collector::new(app.specials, req.stop.clone());
-    let (mut finish, mut prompt_tokens, mut completion_tokens) =
-        (Finish::Length, req.prompt.len(), 0);
+    let (mut finish, mut prompt_tokens, mut cached_tokens, mut completion_tokens) =
+        (Finish::Length, req.prompt.len(), 0, 0);
+    let mut done = false;
     while let Some(ev) = erx.recv().await {
         match ev {
             Event::Token(id) => {
@@ -483,17 +632,27 @@ async fn full_response(
             Event::Done {
                 finish: f,
                 prompt_tokens: p,
+                cached_tokens: c,
                 completion_tokens: n,
             } => {
-                (finish, prompt_tokens, completion_tokens) = (f, p, n);
+                (finish, prompt_tokens, cached_tokens, completion_tokens) = (f, p, c, n);
+                done = true;
                 break;
             }
             Event::Error(e) => {
                 app.metrics.error();
                 return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e);
             }
-            Event::Started | Event::Prefill(_) => {}
+            Event::Started { .. } | Event::Prefill(_) => {}
         }
+    }
+    if !done {
+        app.metrics.error();
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "generation ended unexpectedly",
+        );
     }
     c.finish(&app.tokenizer);
     let mut message = json!({"role": "assistant", "content": c.content});
@@ -501,7 +660,6 @@ async fn full_response(
         message["reasoning"] = json!(c.reasoning);
     }
     if !c.tool_calls.is_empty() {
-        let id = completion_id();
         let calls: Vec<Value> = c
             .tool_calls
             .iter()
@@ -518,12 +676,12 @@ async fn full_response(
         }
     }
     Json(json!({
-        "id": completion_id(),
+        "id": id,
         "object": "chat.completion",
         "created": now(),
         "model": req.model,
         "choices": [{"index": 0, "message": message, "finish_reason": c.finish_reason(finish)}],
-        "usage": usage(prompt_tokens, completion_tokens),
+        "usage": usage(prompt_tokens, cached_tokens, completion_tokens),
     }))
     .into_response()
 }
@@ -573,6 +731,7 @@ fn stream_response(
                 send(data(chunk(delta, None)));
             }
         };
+        let mut finished = false;
         while let Some(ev) = erx.recv().await {
             match ev {
                 Event::Prefill(p) => {
@@ -589,6 +748,7 @@ fn stream_response(
                 Event::Done {
                     finish,
                     prompt_tokens,
+                    cached_tokens,
                     completion_tokens,
                 } => {
                     let d = c.finish(&app.tokenizer);
@@ -597,9 +757,10 @@ fn stream_response(
                     if req.include_usage {
                         send(data(json!({
                             "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                            "choices": [], "usage": usage(prompt_tokens, completion_tokens),
+                            "choices": [], "usage": usage(prompt_tokens, cached_tokens, completion_tokens),
                         })));
                     }
+                    finished = true;
                     break;
                 }
                 Event::Error(e) => {
@@ -607,10 +768,17 @@ fn stream_response(
                     send(data(
                         json!({"error": {"message": e, "type": "server_error"}}),
                     ));
+                    finished = true;
                     break;
                 }
-                Event::Started => {}
+                Event::Started { .. } => {}
             }
+        }
+        if !finished && !cancel.load(Ordering::Relaxed) {
+            app.metrics.error();
+            send(data(
+                json!({"error": {"message": "generation ended unexpectedly", "type": "server_error"}}),
+            ));
         }
         send(SseEvent::default().data("[DONE]"));
     });

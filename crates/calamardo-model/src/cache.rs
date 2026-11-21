@@ -13,7 +13,7 @@ use crate::ops;
 const STEP: i32 = 256;
 
 /// Growing bf16 cache for a global pass.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KvCache {
     keys: Option<Array>,
     values: Option<Array>,
@@ -76,10 +76,17 @@ impl KvCache {
     pub fn arrays(&self) -> Vec<&Array> {
         self.keys.iter().chain(self.values.iter()).collect()
     }
+
+    /// Forgets everything after the first `offset` tokens. The buffers stay;
+    /// the next update overwrites from `offset`.
+    pub fn truncate(&mut self, offset: i32) {
+        self.offset = self.offset.min(offset);
+    }
 }
 
 /// Sliding-window cache that keeps the last `max_size` tokens, rotating in
 /// place during decode.
+#[derive(Clone)]
 pub struct RotatingKvCache {
     keys: Option<Array>,
     values: Option<Array>,
@@ -295,6 +302,7 @@ impl Packed {
 
 /// Global-pass cache in 8 or 4 bits. Same growth as `KvCache`, in blocks of
 /// 256 tokens; new keys and values are quantized as they arrive.
+#[derive(Clone)]
 pub struct QuantKvCache {
     pub keys: Option<Packed>,
     pub values: Option<Packed>,
@@ -392,8 +400,14 @@ impl QuantKvCache {
             .flat_map(|p| p.arrays())
             .collect()
     }
+
+    /// Forgets everything after the first `offset` tokens.
+    pub fn truncate(&mut self, offset: i32) {
+        self.offset = self.offset.min(offset);
+    }
 }
 
+#[derive(Clone)]
 pub enum AttnCache {
     Global(KvCache),
     Quantized(QuantKvCache),
@@ -419,6 +433,7 @@ impl AttnCache {
 }
 
 /// Everything one pass keeps between calls.
+#[derive(Clone)]
 pub struct PassCache {
     pub attn: AttnCache,
     /// Short-convolution states: k, v, post-attention, post-MLP. Each is
@@ -444,4 +459,72 @@ pub fn conv_state(window: &Array, n: i32) -> Result<Array> {
     let w = window.shape()[1];
     let pos = ops::reshape(&ops::arange(w - n, w)?, &[1, n, 1])?;
     ops::take_along_axis(window, &pos, 1)
+}
+
+/// What one pass needs to return to an earlier point of the same sequence.
+/// Global caches only grow at the end, so their snapshot is a length; the
+/// sliding windows and convolution states are kept by handle (MLX copies an
+/// array only if it is written while shared, so the snapshot stays intact).
+#[derive(Clone)]
+pub enum PassSnapshot {
+    Global {
+        offset: i32,
+        conv: [Option<Array>; 4],
+    },
+    Window {
+        cache: RotatingKvCache,
+        conv: [Option<Array>; 4],
+    },
+}
+
+impl PassCache {
+    pub fn snapshot(&self) -> PassSnapshot {
+        match &self.attn {
+            AttnCache::Window(c) => PassSnapshot::Window {
+                cache: c.clone(),
+                conv: self.conv.clone(),
+            },
+            other => PassSnapshot::Global {
+                offset: other.offset(),
+                conv: self.conv.clone(),
+            },
+        }
+    }
+
+    /// Returns to `snap`, which must come from this sequence (an ancestor of
+    /// the current state).
+    pub fn restore(&mut self, snap: &PassSnapshot) {
+        match (snap, &mut self.attn) {
+            (PassSnapshot::Window { cache, conv }, AttnCache::Window(c)) => {
+                *c = cache.clone();
+                self.conv = conv.clone();
+            }
+            (PassSnapshot::Global { offset, conv }, AttnCache::Global(c)) => {
+                c.truncate(*offset);
+                self.conv = conv.clone();
+            }
+            (PassSnapshot::Global { offset, conv }, AttnCache::Quantized(c)) => {
+                c.truncate(*offset);
+                self.conv = conv.clone();
+            }
+            _ => panic!("snapshot from a different cache layout"),
+        }
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.arrays().iter().map(|a| a.nbytes()).sum()
+    }
+}
+
+impl PassSnapshot {
+    /// Memory the snapshot keeps alive beyond the live cache (upper bound).
+    pub fn nbytes(&self) -> usize {
+        match self {
+            Self::Window { cache, conv } => {
+                cache.arrays().iter().map(|a| a.nbytes()).sum::<usize>()
+                    + conv.iter().flatten().map(|a| a.nbytes()).sum::<usize>()
+            }
+            Self::Global { conv, .. } => conv.iter().flatten().map(|a| a.nbytes()).sum(),
+        }
+    }
 }

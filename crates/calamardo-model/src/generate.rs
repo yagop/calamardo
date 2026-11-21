@@ -164,15 +164,55 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+/// Periodic snapshots during a prefill (C-1).
+pub const SNAPSHOT_EVERY: usize = 8192;
+
+/// A point of a session's sequence it can return to.
+#[derive(Clone)]
+pub struct Snapshot {
+    /// Tokens before this point.
+    pub len: usize,
+    /// Taken just before a prompt's last token (vs. periodic).
+    pub prompt_end: bool,
+    passes: Vec<crate::cache::PassSnapshot>,
+}
+
+impl Snapshot {
+    pub fn nbytes(&self) -> usize {
+        self.passes.iter().map(|p| p.nbytes()).sum()
+    }
+}
+
+/// Where a new prompt can start from in a session.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reuse {
+    /// The prompt extends everything the session holds.
+    Live { len: usize },
+    /// The prompt shares the first `len` tokens, saved in snapshot `index`.
+    Snapshot { index: usize, len: usize },
+}
+
+impl Reuse {
+    /// Prompt tokens the session already holds from this point.
+    pub fn tokens(self) -> usize {
+        match self {
+            Self::Live { len } | Self::Snapshot { len, .. } => len,
+        }
+    }
+}
+
 /// A conversation's caches plus the tokens they hold. `feed` follows the
 /// same schedule as `greedy`, so feeding a prompt and then one token at a
 /// time reproduces it.
+#[derive(Clone)]
 pub struct Session<'m> {
     model: &'m Model,
     cache: Vec<PassCache>,
     /// Every token fed so far, in order.
     pub tokens: Vec<u32>,
     pub prefill_step: usize,
+    /// Earlier points of `tokens`, by increasing length.
+    pub snapshots: Vec<Snapshot>,
 }
 
 impl<'m> Session<'m> {
@@ -182,6 +222,95 @@ impl<'m> Session<'m> {
             cache: model.make_cache(kv),
             tokens: Vec::new(),
             prefill_step: PREFILL_STEP,
+            snapshots: Vec::new(),
+        }
+    }
+
+    fn take_snapshot(&mut self, prompt_end: bool) {
+        if let Some(last) = self.snapshots.last_mut()
+            && last.len == self.tokens.len()
+        {
+            last.prompt_end |= prompt_end;
+            return;
+        }
+        self.snapshots.push(Snapshot {
+            len: self.tokens.len(),
+            prompt_end,
+            passes: self.cache.iter().map(|c| c.snapshot()).collect(),
+        });
+    }
+
+    /// The longest start for `prompt`: the live end if the prompt extends
+    /// it, else the longest snapshot inside the common prefix. At least one
+    /// prompt token is always left to feed. With `aligned`, only points at
+    /// multiples of `prefill_step` qualify, so the chunks match a cold run
+    /// and the output is bit for bit the same (C-2).
+    pub fn reuse(&self, prompt: &[u32], aligned: bool) -> Option<Reuse> {
+        let common = self
+            .tokens
+            .iter()
+            .zip(prompt)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let ok = |len: usize| {
+            len > 0 && len < prompt.len() && (!aligned || len.is_multiple_of(self.prefill_step))
+        };
+        let live =
+            (common == self.tokens.len() && ok(common)).then_some(Reuse::Live { len: common });
+        let snap = self
+            .snapshots
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, s)| s.len <= common && ok(s.len))
+            .map(|(index, s)| Reuse::Snapshot { index, len: s.len });
+        match (live, snap) {
+            (Some(l), Some(s)) if s.tokens() > l.tokens() => Some(s),
+            (Some(l), _) => Some(l),
+            (None, s) => s,
+        }
+    }
+
+    /// Returns to snapshot `index`, forgetting what came after it.
+    pub fn restore(&mut self, index: usize) {
+        let snap = self.snapshots[index].clone();
+        for (c, p) in self.cache.iter_mut().zip(&snap.passes) {
+            c.restore(p);
+        }
+        self.tokens.truncate(snap.len);
+        self.snapshots.truncate(index + 1);
+    }
+
+    /// A new session at snapshot `index`; this one is left as it is. The
+    /// caches are shared until one side writes, when MLX copies them.
+    pub fn fork(&self, index: usize) -> Session<'m> {
+        let mut s = self.clone();
+        s.restore(index);
+        s
+    }
+
+    /// Memory held by the caches and the snapshots (an upper bound when
+    /// arrays are shared).
+    pub fn nbytes(&self) -> usize {
+        self.cache.iter().map(|c| c.nbytes()).sum::<usize>()
+            + self.snapshots.iter().map(|s| s.nbytes()).sum::<usize>()
+    }
+
+    /// Drops the oldest periodic snapshot, or else the oldest prompt-end one
+    /// but the last. Returns false if none can go.
+    pub fn drop_snapshot(&mut self) -> bool {
+        let n = self.snapshots.len();
+        let victim = self
+            .snapshots
+            .iter()
+            .position(|s| !s.prompt_end)
+            .or_else(|| (n > 1).then_some(0));
+        match victim {
+            Some(i) => {
+                self.snapshots.remove(i);
+                true
+            }
+            None => false,
         }
     }
 
@@ -209,8 +338,12 @@ impl<'m> Session<'m> {
             self.model.forward(&chunk, &mut self.cache)?;
             eval_cache(&self.cache)?;
             let peak_bytes = mlx_rs::memory::peak_memory()?;
+            let before = self.tokens.len();
             self.tokens.extend_from_slice(&tokens[done..done + n]);
             done += n;
+            if self.tokens.len() / SNAPSHOT_EVERY > before / SNAPSHOT_EVERY {
+                self.take_snapshot(false);
+            }
             ops::clear_cache();
             on_chunk(PrefillChunk {
                 done,
@@ -220,6 +353,10 @@ impl<'m> Session<'m> {
                 active_bytes: mlx_rs::memory::active_memory()?,
                 peak_bytes,
             });
+        }
+        if ids.len() > 1 {
+            // End of a prompt: a retry of it only recomputes the last token.
+            self.take_snapshot(true);
         }
         let last = Array::from_slice(&ids[done..], &[(ids.len() - done) as i32]);
         let lp = step_logprobs(self.model, &last, &mut self.cache)?;
@@ -270,7 +407,9 @@ impl Sampler {
             .iter()
             .enumerate()
             .map(|(i, &x)| (i as u32, ((x as f64 - max) / t).exp()))
-            .filter(|&(_, p)| p > 0.0)
+            // Relative to the best token; what is dropped cannot change the
+            // draw, and top_p then sorts thousands instead of the vocabulary.
+            .filter(|&(_, p)| p > 1e-12)
             .collect();
         let z: f64 = probs.iter().map(|p| p.1).sum();
         if self.top_p < 1.0 {
