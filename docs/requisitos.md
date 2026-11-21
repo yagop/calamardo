@@ -240,6 +240,18 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - Verificado en la GPU (`crates/calamardo/tests/mlx_smoke.rs`): kernel Metal compilado en tiempo de ejecución, `quantized_matmul` nvfp4 y mxfp8 frente a la ruta descomprimida, `mlx_depends` por FFI y `peak_memory`.
 - K-5 se refiere a los kernels propios; el metallib de MLX viene precompilado con la librería.
 
+**Hito 2: caché KV de 8 y 4 bits (estado)**
+
+- `--kv-bits` / `CALAMARDO_KV_BITS` (16, 8 o 4; por defecto 8) y `--kv-group` / `CALAMARDO_KV_GROUP` (32, 64 o 128; por defecto 64). Solo las 8 pasadas globales; las ventanas siguen en bf16. Con 16 bits el camino es el del Hito 1 y la paridad exacta con la referencia se mantiene.
+- Requisito 1: cuantización afín de MLX (`mx.quantize`), u32 empaquetado y escala y bias bf16 por grupo. Cumplido.
+- Requisito 2: el kernel descomprime con el mismo resultado que `mx.dequantize`, bit a bit (test `dequantization_matches_mlx_bit_for_bit`, 4 y 8 bits, grupos 32/64/128). En Metal, `scale * q + bias` en bfloat se evalúa en float y redondea una vez; el kernel lo hace explícitamente, un 30 % más rápido que la aritmética bfloat.
+- Requisito 3: decode de hasta 8 consultas directamente sobre la caché empaquetada (`quant_decode_partial` + `quant_decode_reduce`). K-8: frente a una referencia en float64 sobre la caché descomprimida, error ≤ 2 ulps de bf16 + 1e-3 (el peor caso usa el 39 % de ese margen).
+- K-4: el número de partes se adapta al contexto (≥ 256 claves por parte, máximo 512). Con este kernel, 64 partes son 1,5 veces más lentas en M4 Max: a 160k tokens, 2,08 ms por pasada con 64 partes frente a 1,38 ms con 512 (8 bits), 1,26–1,38 ms (4 bits) y 1,88 ms del `sdpa` de MLX sobre bf16.
+- Requisito 4 (prefill sin descomprimir): pendiente. El prefill descomprime la caché de cada pasada global y usa el kernel relativo; es K-2 (Hito 8). K-3 (no tener a la vez el historial descomprimido de varias pasadas) es del Hito 3.
+- Requisitos 5 y 6: la caché guarda su formato (bits y grupo) y crece por bloques de 256 tokens; la comprobación al restaurar y las vistas de las instantáneas llegan con la caché de prefijos (Hitos 5 y 6).
+- Calidad (verificación 2), 8.042 tokens de prompt y 256 generados forzando los tokens de bf16 (`calamardo kv-eval`): KL media 0,0044 (8 bits) y 0,0076 (4 bits/64, igual con grupo 32); el top-1 coincide en 251 y 248 de 256 tokens. La aguja aparece con los tres formatos a 8k y 31k. Falta medir a 100k y 160k, después del Hito 3 (hoy el pico de memoria del prefill lo impide).
+- Rendimiento con 31k de contexto: prefill a 784 tok/s y decode a 32 tok/s sin drafter en los tres formatos.
+
 **Incoherencias a resolver**
 
 1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k.

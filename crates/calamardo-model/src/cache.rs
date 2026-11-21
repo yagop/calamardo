@@ -230,8 +230,173 @@ impl RotatingKvCache {
     }
 }
 
+/// Storage format of the global passes' KV cache (`--kv-bits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvFormat {
+    /// 16 (bf16), 8 or 4 (MLX affine quantization).
+    pub bits: i32,
+    /// Channels per scale/bias group: 32, 64 or 128. Ignored for 16 bits.
+    pub group_size: i32,
+}
+
+impl KvFormat {
+    pub const BF16: Self = Self {
+        bits: 16,
+        group_size: 64,
+    };
+
+    pub fn new(bits: i32, group_size: i32) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(bits, 4 | 8 | 16),
+            "KV cache bits must be 4, 8 or 16, not {bits}"
+        );
+        anyhow::ensure!(
+            matches!(group_size, 32 | 64 | 128),
+            "KV cache group size must be 32, 64 or 128, not {group_size}"
+        );
+        Ok(Self { bits, group_size })
+    }
+
+    pub fn is_quantized(self) -> bool {
+        self.bits < 16
+    }
+}
+
+/// Affine-quantized keys or values: packed u32, bf16 scales and biases, all
+/// (B, H, capacity, ·).
+#[derive(Clone)]
+pub struct Packed {
+    pub w: Array,
+    pub scales: Array,
+    pub biases: Array,
+}
+
+impl Packed {
+    fn map(&self, f: impl Fn(&Array) -> Result<Array>) -> Result<Self> {
+        Ok(Self {
+            w: f(&self.w)?,
+            scales: f(&self.scales)?,
+            biases: f(&self.biases)?,
+        })
+    }
+
+    fn zip(&self, other: &Self, f: impl Fn(&Array, &Array) -> Result<Array>) -> Result<Self> {
+        Ok(Self {
+            w: f(&self.w, &other.w)?,
+            scales: f(&self.scales, &other.scales)?,
+            biases: f(&self.biases, &other.biases)?,
+        })
+    }
+
+    pub fn arrays(&self) -> [&Array; 3] {
+        [&self.w, &self.scales, &self.biases]
+    }
+}
+
+/// Global-pass cache in 8 or 4 bits. Same growth as `KvCache`, in blocks of
+/// 256 tokens; new keys and values are quantized as they arrive.
+pub struct QuantKvCache {
+    pub keys: Option<Packed>,
+    pub values: Option<Packed>,
+    pub offset: i32,
+    pub format: KvFormat,
+}
+
+impl QuantKvCache {
+    pub fn new(format: KvFormat) -> Self {
+        Self {
+            keys: None,
+            values: None,
+            offset: 0,
+            format,
+        }
+    }
+
+    fn quantize(&self, x: &Array) -> Result<Packed> {
+        let (w, scales, biases) =
+            ops::quantize_affine(x, self.format.group_size, self.format.bits)?;
+        Ok(Packed { w, scales, biases })
+    }
+
+    /// Appends keys and values (B, H, L, D) in bf16. The full buffers stay
+    /// in `keys`/`values`; the first `offset` tokens are valid.
+    pub fn update(&mut self, keys: &Array, values: &Array) -> Result<()> {
+        let prev = self.offset;
+        let l = keys.shape()[2];
+        let (k, v) = (self.quantize(keys)?, self.quantize(values)?);
+        let grow = match &self.keys {
+            None => true,
+            Some(c) => prev + l > c.w.shape()[2],
+        };
+        if grow {
+            let n = (STEP + l - 1) / STEP * STEP;
+            let blank = |p: &Packed| {
+                p.map(|a| {
+                    let mut shape = a.shape().to_vec();
+                    shape[2] = n;
+                    ops::zeros(&shape, a.dtype())
+                })
+            };
+            let (nk, nv) = (blank(&k)?, blank(&v)?);
+            let extend = |old: Option<Packed>, new: Packed| -> Result<Packed> {
+                match old {
+                    None => Ok(new),
+                    Some(o) => {
+                        let o = if prev % STEP != 0 {
+                            o.map(|a| ops::slice(a, 2, 0, prev, 1))?
+                        } else {
+                            o
+                        };
+                        o.zip(&new, |a, b| ops::concatenate(&[a, b], 2))
+                    }
+                }
+            };
+            self.keys = Some(extend(self.keys.take(), nk)?);
+            self.values = Some(extend(self.values.take(), nv)?);
+        }
+        self.offset += l;
+        let end = self.offset;
+        self.keys = Some(
+            self.keys
+                .as_ref()
+                .unwrap()
+                .zip(&k, |a, b| ops::slice_update(a, b, 2, prev, end))?,
+        );
+        self.values = Some(
+            self.values
+                .as_ref()
+                .unwrap()
+                .zip(&v, |a, b| ops::slice_update(a, b, 2, prev, end))?,
+        );
+        Ok(())
+    }
+
+    /// All valid keys and values dequantized to bf16 (B, H, offset, D), as
+    /// `mx.dequantize` does: the reference route.
+    pub fn dequantized(&self) -> Result<(Array, Array)> {
+        let f = self.format;
+        let deq = |p: &Packed| -> Result<Array> {
+            let p = p.map(|a| ops::slice(a, 2, 0, self.offset, 1))?;
+            ops::dequantize_affine(&p.w, &p.scales, &p.biases, f.group_size, f.bits)
+        };
+        Ok((
+            deq(self.keys.as_ref().unwrap())?,
+            deq(self.values.as_ref().unwrap())?,
+        ))
+    }
+
+    pub fn arrays(&self) -> Vec<&Array> {
+        self.keys
+            .iter()
+            .chain(self.values.iter())
+            .flat_map(|p| p.arrays())
+            .collect()
+    }
+}
+
 pub enum AttnCache {
     Global(KvCache),
+    Quantized(QuantKvCache),
     Window(RotatingKvCache),
 }
 
@@ -239,6 +404,7 @@ impl AttnCache {
     pub fn offset(&self) -> i32 {
         match self {
             Self::Global(c) => c.offset,
+            Self::Quantized(c) => c.offset,
             Self::Window(c) => c.offset,
         }
     }
@@ -247,6 +413,7 @@ impl AttnCache {
         match self {
             Self::Global(c) => c.update_and_fetch(keys, values),
             Self::Window(c) => c.update_and_fetch(keys, values),
+            Self::Quantized(_) => anyhow::bail!("quantized caches use update()"),
         }
     }
 }
@@ -263,6 +430,7 @@ impl PassCache {
     pub fn arrays(&self) -> Vec<&Array> {
         let mut out = match &self.attn {
             AttnCache::Global(c) => c.arrays(),
+            AttnCache::Quantized(c) => c.arrays(),
             AttnCache::Window(c) => c.arrays(),
         };
         out.extend(self.conv.iter().flatten());

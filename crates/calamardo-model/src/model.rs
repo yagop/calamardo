@@ -14,8 +14,8 @@ use calamardo_ckpt::{
 use mlx_rs::{Array, Dtype};
 
 use crate::{
-    cache::{AttnCache, KvCache, PassCache, RotatingKvCache, conv_state},
-    kernels::Kernels,
+    cache::{AttnCache, KvCache, KvFormat, PassCache, QuantKvCache, RotatingKvCache, conv_state},
+    kernels::{Kernels, MAX_DECODE_QUERIES},
     ops::{self, f32s},
 };
 
@@ -424,8 +424,42 @@ impl Attention {
         let q = ops::transpose(&q, &[0, 2, 1, 3])?;
         let k = ops::transpose(&k, &[0, 2, 1, 3])?;
         let v = ops::transpose(&v, &[0, 2, 1, 3])?;
-        let (k, v) = cache.attn.update_and_fetch(&k, &v)?;
-        let out = self.attention(kern, &q, &k, &v, &position_bias, &sinks, &cache.attn)?;
+        let out = match &mut cache.attn {
+            AttnCache::Quantized(c) => {
+                c.update(&k, &v)?;
+                if l <= MAX_DECODE_QUERIES {
+                    let (keys, values) = (c.keys.as_ref().unwrap(), c.values.as_ref().unwrap());
+                    kern.quantized_decode_attention(
+                        &q,
+                        keys,
+                        values,
+                        c.offset,
+                        &position_bias,
+                        &sinks,
+                        self.scaling,
+                        c.format,
+                    )?
+                } else {
+                    // Prefill reads the history dequantized (K-2 will read it packed).
+                    let (k, v) = c.dequantized()?;
+                    let key_start = ops::broadcast_to(&ops::i32s(0), &[b])?;
+                    kern.relative_attention(
+                        &q,
+                        &k,
+                        &v,
+                        &position_bias,
+                        &sinks,
+                        self.scaling,
+                        self.window,
+                        &key_start,
+                    )?
+                }
+            }
+            attn => {
+                let (k, v) = attn.update_and_fetch(&k, &v)?;
+                self.attention(kern, &q, &k, &v, &position_bias, &sinks, attn)?
+            }
+        };
 
         let out = ops::f32(&ops::reshape(&out, &[b, l, -1])?)?;
         let out = ops::mul(&out, &ops::sigmoid(&ops::f32(&gate)?)?)?;
@@ -1015,12 +1049,16 @@ impl Model {
         &self.config.text_config
     }
 
-    /// One cache per pass, in pass order.
-    pub fn make_cache(&self) -> Vec<PassCache> {
+    /// One cache per pass, in pass order. Global passes store their keys and
+    /// values in `kv`; sliding-window passes stay bf16.
+    pub fn make_cache(&self, kv: KvFormat) -> Vec<PassCache> {
         calamardo_ckpt::schedule::passes(self.text())
             .into_iter()
             .map(|p| PassCache {
                 attn: match p.attn {
+                    calamardo_ckpt::schedule::AttnKind::Global if kv.is_quantized() => {
+                        AttnCache::Quantized(QuantKvCache::new(kv))
+                    }
                     calamardo_ckpt::schedule::AttnKind::Global => {
                         AttnCache::Global(KvCache::default())
                     }

@@ -34,5 +34,5 @@ case "$PROMPT" in
     *.ids) INPUT="--tokens=$(tr -s ' \n' ',' < "$PROMPT" | sed 's/^,//; s/,$//')" ;;
     *) INPUT="--raw=$(cat "$PROMPT")" ;;
 esac
-"$ROOT/target/release/calamardo" generate "$INPUT" --ids --max-tokens "$MAX" > "$TMP/ours.txt"
+"$ROOT/target/release/calamardo" generate "$INPUT" --ids --kv-bits 16 --max-tokens "$MAX" > "$TMP/ours.txt"
 python3 -I "$ROOT/scripts/reference/compare.py" "$TMP/ref.json" "$TMP/ours.txt"

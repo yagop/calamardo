@@ -35,7 +35,19 @@ enum Cmd {
         #[arg(long, env = "CALAMARDO_KV_BITS", default_value_t = 8)]
         kv_bits: usize,
     },
-    /// Greedy generation with a bf16 cache (milestone 1 check).
+    /// KV cache quality: generates greedily with a bf16 cache, then replays
+    /// the same tokens with each quantized format and reports the mean KL
+    /// divergence and top-1 agreement against bf16 (verification 2).
+    KvEval {
+        /// File with the full prompt text (chat format included).
+        prompt_file: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        tokens: usize,
+        /// Formats to compare, as bits/group.
+        #[arg(long, value_delimiter = ',', default_value = "8/64,4/64")]
+        formats: Vec<String>,
+    },
+    /// Greedy generation (milestone 1 check uses --kv-bits 16).
     Generate {
         /// User message, wrapped in the chat format.
         #[arg(long, conflicts_with_all = ["raw", "tokens"])]
@@ -54,6 +66,12 @@ enum Cmd {
         /// Print the token ids instead of the text.
         #[arg(long)]
         ids: bool,
+        /// Bits of the global passes' KV cache: 16, 8 or 4.
+        #[arg(long, env = "CALAMARDO_KV_BITS", default_value_t = 8)]
+        kv_bits: i32,
+        /// Channels per scale/bias group of the quantized KV cache.
+        #[arg(long, env = "CALAMARDO_KV_GROUP", default_value_t = 64)]
+        kv_group: i32,
     },
 }
 
@@ -65,6 +83,28 @@ fn main() -> Result<()> {
     };
     match cli.cmd {
         Cmd::Inspect { kv_bits } => inspect(&Checkpoint::open(&dir)?, kv_bits),
+        Cmd::KvEval {
+            prompt_file,
+            tokens,
+            formats,
+        } => {
+            let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+                .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
+            let text = std::fs::read_to_string(&prompt_file)?;
+            let prompt = tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+                .get_ids()
+                .to_vec();
+            let formats = formats
+                .iter()
+                .map(|f| {
+                    let (b, g) = f.split_once('/').unwrap_or((f, "64"));
+                    calamardo_model::cache::KvFormat::new(b.parse()?, g.parse()?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            kv_eval(&dir, &prompt, tokens, &formats)
+        }
         Cmd::Generate {
             prompt,
             raw,
@@ -72,7 +112,10 @@ fn main() -> Result<()> {
             reasoning_effort,
             max_tokens,
             ids,
+            kv_bits,
+            kv_group,
         } => {
+            let kv = calamardo_model::cache::KvFormat::new(kv_bits, kv_group)?;
             let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
                 .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
             let text = match (prompt, raw) {
@@ -89,7 +132,7 @@ fn main() -> Result<()> {
                 (None, Some(t)) => t,
                 (None, None) => anyhow::bail!("pass --prompt, --raw or --tokens"),
             };
-            generate(&dir, &tokenizer, &prompt_ids, max_tokens, ids)
+            generate(&dir, &tokenizer, &prompt_ids, max_tokens, ids, kv)
         }
     }
 }
@@ -148,6 +191,7 @@ fn generate(
     prompt: &[u32],
     max_tokens: usize,
     ids: bool,
+    kv: calamardo_model::cache::KvFormat,
 ) -> Result<()> {
     use std::io::Write;
     use std::time::Instant;
@@ -160,7 +204,11 @@ fn generate(
         t.elapsed().as_secs_f64(),
         mlx_rs::memory::active_memory()? as f64 / 1e9
     );
-    eprintln!("prompt: {} tokens", prompt.len());
+    eprintln!(
+        "prompt: {} tokens · global KV cache {} bits",
+        prompt.len(),
+        kv.bits
+    );
 
     mlx_rs::memory::reset_peak_memory()?;
     let t = Instant::now();
@@ -172,6 +220,7 @@ fn generate(
         prompt,
         max_tokens,
         calamardo_model::generate::PREFILL_STEP,
+        kv,
         |tok| {
             first.get_or_insert(t.elapsed().as_secs_f64());
             if ids {
@@ -195,6 +244,72 @@ fn generate(
         tokens.len(),
         mlx_rs::memory::peak_memory()? as f64 / 1e9
     );
+    Ok(())
+}
+
+fn kv_eval(
+    dir: &std::path::Path,
+    prompt: &[u32],
+    n: usize,
+    formats: &[calamardo_model::cache::KvFormat],
+) -> Result<()> {
+    use calamardo_model::{cache::KvFormat, generate, ops};
+    let model = calamardo_model::Model::load(dir)?;
+    eprintln!("prompt: {} tokens, {n} generated", prompt.len());
+
+    // bf16 reference: greedy tokens and their distributions.
+    let tokens = generate::greedy(
+        &model,
+        prompt,
+        n,
+        generate::PREFILL_STEP,
+        KvFormat::BF16,
+        |_| true,
+    )?;
+    let mut reference = Vec::with_capacity(tokens.len());
+    generate::teacher_forced(
+        &model,
+        prompt,
+        &tokens,
+        generate::PREFILL_STEP,
+        KvFormat::BF16,
+        |_, lp| {
+            reference.push(lp.clone());
+            Ok(())
+        },
+    )?;
+
+    println!("format     mean KL     max KL     top-1 agree");
+    for &f in formats {
+        let (mut sum, mut max, mut agree) = (0.0f64, 0.0f64, 0usize);
+        generate::teacher_forced(
+            &model,
+            prompt,
+            &tokens,
+            generate::PREFILL_STEP,
+            f,
+            |i, lp| {
+                let r = &reference[i];
+                let kl = ops::sum(&ops::mul(&ops::exp(r)?, &ops::sub(r, lp)?)?, &[0, 1], false)?;
+                let same = ops::astype(&ops::argmax(lp, -1)?, mlx_rs::Dtype::Uint32)?;
+                ops::eval(&[&kl, &same])?;
+                let kl = kl.item_exact::<f32>() as f64;
+                sum += kl;
+                max = max.max(kl);
+                agree += usize::from(same.item_exact::<u32>() == tokens[i]);
+                Ok(())
+            },
+        )?;
+        println!(
+            "{:>2} bits/{:<3} {:>9.5} {:>10.5} {:>8}/{}",
+            f.bits,
+            f.group_size,
+            sum / tokens.len() as f64,
+            max,
+            agree,
+            tokens.len()
+        );
+    }
     Ok(())
 }
 

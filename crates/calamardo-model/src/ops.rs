@@ -188,6 +188,7 @@ binary! {
 
 unary! {
     sqrt => mlx_sqrt,
+    exp => mlx_exp,
     tanh => mlx_tanh,
     sigmoid => mlx_sigmoid,
     log => mlx_log,
@@ -484,6 +485,67 @@ pub fn gather_qmm(
             mode.as_ptr(),
             gs,
             sorted_indices,
+            s,
+        )
+    })
+}
+
+/// `mx.quantize(w, group_size, bits)` (affine): packed u32, scales, biases.
+pub fn quantize_affine(w: &Array, group_size: i32, bits: i32) -> Result<(Array, Array, Array)> {
+    let s = stream();
+    let opt = |v: i32| sys::mlx_optional_int {
+        value: v,
+        has_value: true,
+    };
+    // SAFETY: `res` is a fresh vector, wrapped so it is freed.
+    let res = unsafe {
+        let mut res = sys::mlx_vector_array_new();
+        if sys::mlx_quantize(
+            &mut res,
+            w.as_ptr(),
+            opt(group_size),
+            opt(bits),
+            c"affine".as_ptr(),
+            null(),
+            s.as_ptr(),
+        ) != 0
+        {
+            sys::mlx_vector_array_free(res);
+            bail!("MLX op quantize failed: {}", last_error());
+        }
+        Vector(res)
+    };
+    Ok((res.get(0)?, res.get(1)?, res.get(2)?))
+}
+
+/// `mx.dequantize(w, scales, biases, group_size, bits)` (affine), in the
+/// dtype of the scales.
+pub fn dequantize_affine(
+    w: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array> {
+    let opt = |v: i32| sys::mlx_optional_int {
+        value: v,
+        has_value: true,
+    };
+    let no_dtype = sys::mlx_optional_dtype {
+        value: 0,
+        has_value: false,
+    };
+    op("dequantize", |r, s| unsafe {
+        sys::mlx_dequantize(
+            r,
+            w.as_ptr(),
+            scales.as_ptr(),
+            biases.as_ptr(),
+            opt(group_size),
+            opt(bits),
+            c"affine".as_ptr(),
+            null(),
+            no_dtype,
             s,
         )
     })
