@@ -618,7 +618,37 @@ struct Experts {
 
 impl Experts {
     /// x: (B, L, D), indices: (B, L, K). Returns (B, L, K, D).
-    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+    fn forward(&self, kern: &Kernels, x: &Array, indices: &Array) -> Result<Array> {
+        let [b, l, d] = x.shape()[..] else {
+            unreachable!()
+        };
+        let top_k = indices.shape()[2];
+        if b == 1 && (2..=MAX_DECODE_QUERIES).contains(&l) && l * top_k < 64 {
+            // A few tokens (speculative verification, short chunks): each
+            // chosen expert is read once for all its tokens (K-7). Bit for
+            // bit gather_qmm's unsorted path, which the reference takes
+            // below 64 routes (it sorts from 64 on, see below).
+            let idx = ops::reshape(indices, &[l, top_k])?;
+            let project = |p: &QuantizedSwitchLinear, x: &Array, per_route: bool| {
+                kern.gather_qmv_shared(
+                    x,
+                    &p.weight,
+                    &p.scales,
+                    p.global_scale.as_ref(),
+                    &idx,
+                    per_route,
+                    p.group_size,
+                    p.bits,
+                )
+            };
+            let gate_up = project(&self.gate_up, &ops::reshape(x, &[l, d])?, false)?;
+            let n = gate_up.shape()[1];
+            let gate = ops::slice(&gate_up, -1, 0, n, 2)?;
+            let up = ops::slice(&gate_up, -1, 1, n, 2)?;
+            let h = softcapped_swiglu(&gate, &up, self.gate_softcap, self.up_softcap)?;
+            let out = project(&self.down, &h, true)?;
+            return ops::reshape(&out, &[1, l, top_k, -1]);
+        }
         let x = ops::expand_dims(x, &[-2, -3])?;
         let do_sort = indices.size() >= 64;
         let (x, idx, inv_order) = if do_sort {
@@ -680,7 +710,7 @@ impl Moe {
             ROUTER_SCORE_EPS,
             self.route_scale,
         )?;
-        let expert_states = self.experts.forward(hidden, &indices)?;
+        let expert_states = self.experts.forward(k, hidden, &indices)?;
         let expert_states = ops::mul(
             &ops::f32(&expert_states)?,
             &ops::expand_dims(&weights, &[-1])?,
@@ -1096,6 +1126,34 @@ impl Model {
     pub fn embed(&self, tokens: &Array) -> Result<Array> {
         let h = ops::take(&self.embed, tokens, 0)?;
         ops::rms_norm(&h, Some(&self.embed_norm), self.text().rms_norm_eps)
+    }
+
+    /// Benchmarks only: the MoE of every pass in order, each added to its
+    /// input. `hidden`: (1, L, D) bf16.
+    #[doc(hidden)]
+    pub fn moe_chain(&self, hidden: &Array) -> Result<Array> {
+        let mut h = hidden.clone();
+        for p in calamardo_ckpt::schedule::passes(&self.config.text_config) {
+            let out = self.layers[p.layer].moe.forward(&self.kernels, &h)?;
+            h = ops::add(&h, &ops::mul(&out, &ops::scalar(0.01, h.dtype())?)?)?;
+        }
+        Ok(h)
+    }
+
+    /// Tests only: layer `i`'s expert projections (weight, scales, global
+    /// scale, group size, bits) for gate/up and down.
+    #[doc(hidden)]
+    pub fn expert_weights(&self, i: usize) -> [(Array, Array, Option<Array>, i32, i32); 2] {
+        let e = &self.layers[i].moe.experts;
+        [&e.gate_up, &e.down].map(|p| {
+            (
+                p.weight.clone(),
+                p.scales.clone(),
+                p.global_scale.clone(),
+                p.group_size,
+                p.bits,
+            )
+        })
     }
 
     /// The vocabulary projection (V, D).

@@ -682,6 +682,162 @@ const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
     }
 "#;
 
+// K-7: the quantized experts of 2 to 7 tokens (speculative verification,
+// short prefill chunks) reading each expert's weights once. MLX's gather_qmm runs
+// one matrix-vector product per route, so an expert chosen by several tokens
+// is read once per token (4 identical tokens cost 18.1 ms over the 48
+// passes against 7.9 for one). One threadgroup per route: the first route
+// of each expert takes all the routes on it (at most one per token, since a
+// token never picks an expert twice) and the others exit. The arithmetic
+// is MLX's, lane for lane: its fp_qmv_impl (one u32 of values per lane, in
+// blocks of 32 lanes, with a last partial block where lanes past the end add
+// nothing) or, when MLX takes it (N % 8 == 0 and K a multiple of
+// 2 * 32 * 32 / BITS), its fp_qmv_fast_impl (two u32 per lane, PPT = 2):
+// `scale * (x0 w0 + x1 w1 + x2 w2 + x3 w3 ...)` accumulated per block,
+// simd_sum, then the global scale, so the results equal gather_qmm's bit for
+// bit (tested with every format the checkpoint uses).
+// Rows of `x`: one per token (XR = 0, the gate/up projection) or one per
+// route (XR = 1, the down projection).
+const GATHER_QMV_SHARED_HEADER: &str = r#"
+inline float e2m1_to_float(uint bits) {
+    half c = as_type<half>(ushort((bits & 7) << 9));
+    c *= 16384.0;
+    return float((bits & 8) ? -c : c);
+}
+inline float e4m3_to_float(uint bits) {
+    ushort v = bits & 127;
+    ushort sign_bit = ushort((bits >> 7) & 1) << 15;
+    ushort u = (v << 7) | (((v + 1) >> 7) << 14) | sign_bit;
+    half c = as_type<half>(u);
+    return float(half(c * 256.0));
+}
+inline float e8m0_to_float(uint bits) {
+    uint out = bits == 0 ? 0x400000 : (bits << 23);
+    return as_type<float>(out);
+}
+"#;
+
+const GATHER_QMV_SHARED_SOURCE: &str = r#"
+    constexpr int VPT = 32 / BITS * PPT;    // values per lane and block (PPT u32)
+    constexpr int BLOCK = VPT * 32;
+    constexpr int ROW_BYTES = K * BITS / 8;
+    constexpr int KG = K / GROUP;
+    constexpr int SSPT = GROUP / VPT;       // lanes per scale
+    static_assert(K % VPT == 0 && N % 8 == 0, "unsupported shape");
+    const int r = int(threadgroup_position_in_grid.y);
+    const int sg = int(simdgroup_index_in_threadgroup);
+    const int lane = int(thread_index_in_simdgroup);
+    static_assert(NR <= 64 && MAXT <= 8, "at most 64 routes");
+    const uint e = indices[r];
+    // Every route on this expert, as a 64-bit mask from one vote per half.
+    const bool m0 = lane < NR && indices[lane] == e;
+    const bool m1 = lane + 32 < NR && indices[min(lane + 32, NR - 1)] == e;
+    const ulong lo = static_cast<ulong>(static_cast<simd_vote::vote_t>(simd_ballot(m0))) & 0xffffffffUL;
+    const ulong hi = static_cast<ulong>(static_cast<simd_vote::vote_t>(simd_ballot(m1))) & 0xffffffffUL;
+    ulong mask = lo | (hi << 32);
+    // Only the expert's first route does the work.
+    if (int(ctz(mask)) != r) {
+        return;
+    }
+    int routes[MAXT];
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < MAXT; j++) {
+        routes[j] = mask != 0 ? int(ctz(mask)) : -1;
+        mask &= mask - 1;
+    }
+
+    const int out_row = int(threadgroup_position_in_grid.x) * 8 + sg * 4;
+    const device uint8_t* ws = (const device uint8_t*)w + (size_t(e) * N + out_row) * ROW_BYTES + lane * 4 * PPT;
+    const device uint8_t* sl = scales + (size_t(e) * N + out_row) * KG + lane / SSPT;
+    float result[MAXT][4];
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < MAXT; j++) {
+        _Pragma("clang loop unroll(full)")
+        for (int row = 0; row < 4; row++) {
+            result[j][row] = 0.0f;
+        }
+    }
+
+    for (int k = 0; k < K; k += BLOCK) {
+        // A last partial block, as MLX's: lanes past the end add nothing.
+        if (k + lane * VPT >= K) {
+            break;
+        }
+        // The 4 rows' weights of this block, decoded once for all routes.
+        float wd[4][VPT];
+        float s[4];
+        _Pragma("clang loop unroll(full)")
+        for (int row = 0; row < 4; row++) {
+            const device uint8_t* wl = ws + row * ROW_BYTES + k * BITS / 8;
+            const uint sbits = sl[row * KG + k / GROUP];
+            s[row] = GROUP == 16 ? e4m3_to_float(sbits) : e8m0_to_float(sbits);
+            if (BITS == 4) {
+                const device uint16_t* w16 = (const device uint16_t*)wl;
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < VPT / 4; i++) {
+                    const uint h = w16[i];
+                    wd[row][4 * i] = e2m1_to_float(h & 15);
+                    wd[row][4 * i + 1] = e2m1_to_float((h >> 4) & 15);
+                    wd[row][4 * i + 2] = e2m1_to_float((h >> 8) & 15);
+                    wd[row][4 * i + 3] = e2m1_to_float((h >> 12) & 15);
+                }
+            } else {
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < VPT; i++) {
+                    wd[row][i] = e4m3_to_float(wl[i]);
+                }
+            }
+        }
+        // One route at a time: only its inputs are held.
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < MAXT; j++) {
+            if (routes[j] < 0) {
+                continue;
+            }
+            const int xrow = XR ? routes[j] : routes[j] / TOPK;
+            const device T* xp = x + size_t(xrow) * K + k + lane * VPT;
+            float xt[VPT];
+            _Pragma("clang loop unroll(full)")
+            for (int i = 0; i < VPT; i++) {
+                xt[i] = float(xp[i]);
+            }
+            _Pragma("clang loop unroll(full)")
+            for (int row = 0; row < 4; row++) {
+                float accum = 0.0f;
+                if (BITS == 4) {
+                    _Pragma("clang loop unroll(full)")
+                    for (int i = 0; i < VPT / 4; i++) {
+                        accum += (xt[4 * i] * wd[row][4 * i] + xt[4 * i + 1] * wd[row][4 * i + 1] +
+                                  xt[4 * i + 2] * wd[row][4 * i + 2] + xt[4 * i + 3] * wd[row][4 * i + 3]);
+                    }
+                } else {
+                    _Pragma("clang loop unroll(full)")
+                    for (int i = 0; i < VPT; i++) {
+                        accum += xt[i] * wd[row][i];
+                    }
+                }
+                // Two statements, as MLX's qdot returns `scale * accum`:
+                // one expression would let the compiler fuse them (fma) and
+                // round differently.
+                const float scaled = s[row] * accum;
+                result[j][row] += scaled;
+            }
+        }
+    }
+
+    const float inv_scale_enc = HAS_GS ? gs[e] / (448.0f * 6.0f) : 1.0f;
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < MAXT; j++) {
+        _Pragma("clang loop unroll(full)")
+        for (int row = 0; row < 4; row++) {
+            const float v = simd_sum(result[j][row]);
+            if (lane == 0 && routes[j] >= 0) {
+                y[size_t(routes[j]) * N + out_row + row] = HAS_GS ? T(v * inv_scale_enc) : T(v);
+            }
+        }
+    }
+"#;
+
 /// Most key parts per KV head of the quantized decode attention (K-4). On M4
 /// Max, 512 parts of this kernel beat the 64 that suit MLX's own attention
 /// (1.38 vs 2.08 ms per pass at 160k tokens, see `bench_decode_160k`).
@@ -807,6 +963,7 @@ pub struct Kernels {
     quant_reduce: MetalKernel,
     quant_verify: MetalKernel,
     relative_quant: MetalKernel,
+    gather_qmv_shared: MetalKernel,
     /// Key parts per KV head of the quantized decode attention; 0 adapts to
     /// the context length.
     pub decode_parts: i32,
@@ -870,7 +1027,7 @@ impl Kernels {
                 &["pm", "ps", "po", "sinks"],
                 &["out"],
                 QUANT_DECODE_REDUCE_SOURCE,
-                contiguous,
+                contiguous.clone(),
             ))?,
             relative_quant: ops::with_mlx_message(MetalKernel::new(
                 "relative_attention_quantized",
@@ -891,6 +1048,16 @@ impl Kernels {
                 &["out"],
                 &quant_relative_source()?,
                 MetalKernelOptions::default(),
+            ))?,
+            gather_qmv_shared: ops::with_mlx_message(MetalKernel::new(
+                "gather_qmv_shared",
+                &["x", "w", "scales", "gs", "indices"],
+                &["y"],
+                GATHER_QMV_SHARED_SOURCE,
+                MetalKernelOptions {
+                    header: GATHER_QMV_SHARED_HEADER.to_string(),
+                    ..contiguous
+                },
             ))?,
             decode_parts: 0,
             decode_keys_per_step: 0,
@@ -1266,6 +1433,91 @@ impl Kernels {
                 (32, 1, 1),
                 MetalKernelApplyOptions {
                     template_args,
+                    ..Default::default()
+                },
+            ))?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+
+    /// `gather_qmm` (nvfp4, mxfp4 or mxfp8, transposed weights) for a few
+    /// tokens, reading each chosen expert's weights once (K-7). x: (T, K)
+    /// with one row per token, or (T * top_k, K) with one per route when
+    /// `x_per_route`; w: (E, N, K * bits / 32) u32; scales: (E, N, K / group)
+    /// u8; global_scale: (E,) f32 for nvfp4 with a global scale; indices:
+    /// (T, top_k). Returns (T * top_k, N) in x's dtype, route by route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_qmv_shared(
+        &self,
+        x: &Array,
+        w: &Array,
+        scales: &Array,
+        global_scale: Option<&Array>,
+        indices: &Array,
+        x_per_route: bool,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Array> {
+        let [tokens, top_k] = indices.shape()[..] else {
+            anyhow::bail!("indices must be (tokens, top_k)")
+        };
+        let [experts, n, words] = w.shape()[..] else {
+            anyhow::bail!("expert weights must be (E, N, K * bits / 32)")
+        };
+        anyhow::ensure!(x.ndim() == 2, "x must be (rows, K)");
+        let k = x.shape()[1];
+        let routes = tokens * top_k;
+        anyhow::ensure!(
+            w.dtype() == Dtype::Uint32
+                && words * 32 == k * bits
+                && scales.dtype() == Dtype::Uint8
+                && k % group_size == 0
+                && scales.shape() == [experts, n, k / group_size]
+                && global_scale
+                    .is_none_or(|g| g.dtype() == Dtype::Float32 && g.shape() == [experts]),
+            "expert weights, scales or global scale do not match x (K {k})"
+        );
+        anyhow::ensure!(
+            (1..=MAX_DECODE_QUERIES).contains(&tokens)
+                && matches!((bits, group_size), (4, 16) | (4, 32) | (8, 32))
+                && k % (32 / bits) == 0
+                && n % 8 == 0
+                && x.shape()[0] == if x_per_route { routes } else { tokens },
+            "unsupported shared expert gather: {tokens} tokens, bits {bits}, group {group_size}, K {k}, N {n}"
+        );
+        let indices = ops::astype(&ops::reshape(indices, &[routes])?, Dtype::Uint32)?;
+        // The scales stand in for an absent global scale (never read).
+        let gs = global_scale.unwrap_or(scales);
+        // SAFETY: one threadgroup of two simdgroups per (8 output rows,
+        // route); the shapes and dtypes are checked above and every index
+        // stays within them, as the kernel describes. (Routing never picks
+        // an expert twice for one token, so at most `tokens` routes share
+        // one; only all-NaN router logits could break that, and those
+        // already give garbage.)
+        let out = unsafe {
+            ops::with_mlx_message(self.gather_qmv_shared.apply(
+                &[x, w, scales, gs, &indices],
+                &[MetalKernelOutput {
+                    shape: vec![routes, n],
+                    dtype: x.dtype(),
+                }],
+                (n / 8 * 64, routes, 1),
+                (64, 1, 1),
+                MetalKernelApplyOptions {
+                    template_args: vec![
+                        ("T".to_string(), TemplateArg::Dtype(x.dtype())),
+                        int("BITS", bits),
+                        int("GROUP", group_size),
+                        int("K", k),
+                        int("N", n),
+                        int("TOPK", top_k),
+                        int("MAXT", tokens),
+                        // MLX's choice between its qmv and qmv_fast kernels.
+                        int("PPT", if k % (32 / bits * 2 * 32) == 0 { 2 } else { 1 }),
+                        int("NR", routes),
+                        int("XR", x_per_route as i32),
+                        int("HAS_GS", global_scale.is_some() as i32),
+                    ],
                     ..Default::default()
                 },
             ))?

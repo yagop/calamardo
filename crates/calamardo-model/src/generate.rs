@@ -438,6 +438,20 @@ impl<'m> Session<'m> {
             .forward_ex(tokens, &mut self.cache, &ids, keep_windows)
     }
 
+    /// Benchmarks only: one target forward over `tokens`, as a prefill
+    /// chunk or (`verify`) as a speculative verification, kept in the
+    /// session (no rewind). Returns the seconds until its results exist.
+    #[doc(hidden)]
+    pub fn bench_forward(&mut self, tokens: &[u32], verify: bool) -> Result<f64> {
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let t = std::time::Instant::now();
+        let (logits, _) = self.forward(&Array::from_slice(&ids, &[1, ids.len() as i32]), verify)?;
+        ops::eval(&[&logits])?;
+        self.eval_state()?;
+        self.tokens.extend_from_slice(tokens);
+        Ok(t.elapsed().as_secs_f64())
+    }
+
     fn add_context(&mut self, hidden: Option<&Array>) -> Result<()> {
         if let (Some(d), Some(state), Some(h)) = (self.drafter, self.draft.as_mut(), hidden) {
             d.add_context(state, h)?;

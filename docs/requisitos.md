@@ -135,7 +135,7 @@ La memoria transitoria del prefill no debe crecer con el contexto. En Ollama, a 
 | K-4 | Decode: kernel de atención dividido en 64 partes en M4 Max (`applegpu_g16s`), igual que en M4 Pro | Obligatorio |
 | K-5 | Kernels Metal compilados en tiempo de ejecución (`fast::metal_kernel`) con `ensure_row_contiguous`, sin Xcode ni `metallib` precompilado | Obligatorio |
 | K-6 | Fusionar las operaciones pequeñas de cada pasada (mezcla de residuales, controlador del bucle, normalizaciones) y compilar cada pasada con `compile`, para reducir lanzamientos de kernels | Deseable |
-| K-7 | Kernel MoE fusionado para un token con expertos nvfp4 (gate+up en una pasada) | Deseable |
+| K-7 | Kernel de expertos para pocos tokens (verificación especulativa) que lea cada experto una vez (originalmente: MoE fusionado para un token con expertos nvfp4) | Deseable |
 | K-8 | Cada kernel nuevo se compara contra la ruta de referencia de MLX y se exige igualdad exacta, o una tolerancia documentada si cambia el redondeo | Obligatorio |
 | K-9 | Medir el pico de cada paso (`mlx_get_peak_memory`) y exponerlo en los logs y en `/metrics` | Obligatorio |
 
@@ -345,7 +345,7 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - K-2 y K-3: con caché de 8 o 4 bits, el prefill ya no descomprime el historial de ninguna pasada global. Una variante del kernel relativo carga cada bloque de claves y valores directamente del formato empaquetado, con la misma expresión de descompresión que `mx.dequantize`, y su salida es bit a bit la del kernel bf16 sobre la caché descomprimida (test con 4 y 8 bits, grupos 32/64/128, contextos de 40 a 3.000 y bloques parciales). Así que los resultados no cambian.
 - Medido con 166.561 tokens y caché de 8 bits: pico transitorio máximo de 1,74 GB (antes 2,13); la velocidad no cambia (398 tok/s a 145k, 319 s en frío), porque la descompresión no era el cuello de botella.
 - Bias sobre la marcha (parte de K-2): no se hace, a propósito. En esta arquitectura la tabla de bias mide L × 24 × 1.024 (unos 100 MB por pasada con trozos de 2.048) y no crece con el contexto, así que el problema de Ollama no existe; calcularla dentro del kernel cambiaría el orden de las sumas y rompería la paridad exacta con la referencia.
-- Pendiente (deseable): K-6 (fusionar las operaciones pequeñas y `compile` por pasada) y K-7 (MoE fusionado para un token). El kernel de verificación especulativa está hecho (siguiente apartado).
+- Pendiente (deseable): K-6 (fusionar las operaciones pequeñas y `compile` por pasada) y K-7 (hecho más abajo, para pocos tokens). El kernel de verificación especulativa está hecho (siguiente apartado).
 
 **Contexto de 512k y kernel de verificación (22 de noviembre de 2026)**
 
@@ -382,6 +382,51 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
   - Prefill en frío: 239 tok/s.
   - Una sesión guardada por un servidor con `--no-draft` no trae estado del drafter y, al cargarla con drafter, no especula hasta la siguiente conversación.
 - Desglose de una ronda de bloque 2 a 1k: borrador 4 ms, construir el grafo 3 ms, pasada de verificación 37 ms (frente a 26 de un decode) y rebobinado 1 ms. Casi todo lo que cuesta de más la verificación es el MoE: dos tokens leen hasta el doble de expertos.
+
+**Comparación con Ollama y MLX `main` (22 de noviembre de 2026)**
+
+- Misma prueba que el borrador de PR para Ollama en M4 Max: prompt de aguja de ~29k tokens (31.157 con nuestra plantilla), razonamiento «low», temperatura 0, un nonce distinto por petición (sin caché de prefijos) y caché bf16. Respuesta correcta en todas.
+
+  | | Ollama (MLX 0.32.4-82, kernels M4 Max) | Calamardo |
+  |---|---:|---:|
+  | Prefill | 570 tok/s | 782–803 tok/s |
+  | Generación con drafter | 36,7 tok/s (34,1–40,8) | 35,9 tok/s (30,5–40,7), aceptación 49–54 % |
+  | Generación sin drafter | — | 32,5 tok/s |
+
+  Ollama generó 742–1.600 tokens por respuesta y Calamardo 117–201. En respuestas tan cortas la política de bloque pasa buena parte del tiempo explorando.
+- Los kernels de Inkling que añadió Ollama (`nvfp4_matvec`, `nvfp4_matmul`, activaciones NVFP4) son suyos, no de MLX. El de expertos para pocos tokens, que lee cada experto una vez para todos los tokens que lo eligen, solo se activa en M5; en M4 usa el `gather_qmm` normal de MLX, como nosotros.
+- MLX `main` (82 commits tras 0.32.4, sin rueda publicada) mejora `quantized_matmul` con pocas filas (`qmv_mma`), pero no `gather_qmm`. En este modelo solo están cuantizados los expertos; las capas densas son bf16. Actualizar exigiría compilar MLX desde el código (`cmake`; sin compilador `metal`, en modo JIT), y la ganancia esperable es pequeña: menos coste de CPU por llamada a kernels propios y algún arreglo, como la cuantización afín de grupos con todos los valores negativos.
+- Lo que más falta para pasar de ~36 tok/s: un kernel de expertos para verificación que lea cada experto una vez para todos los tokens que lo eligen (K-7, siguiente apartado).
+
+**K-7: expertos de pocos tokens leídos una vez (22 de noviembre de 2026)**
+
+- Dónde se va una pasada de verificación (caché de 8 bits, contexto de 1k):
+
+  | Tokens | Forward | Solo expertos (48 pasadas) |
+  |---|---|---|
+  | 1 | 30,3 ms | 7,9 ms |
+  | 2 | 40,8 ms | 12,0 ms |
+  | 4 | 48,9 ms | 19,4 ms |
+  | 8 | 61,6 ms | 32,6 ms |
+
+  - El `gather_qmm` de MLX hace un producto matriz-vector por ruta, así que un experto elegido por varios tokens se lee una vez por token: 4 tokens idénticos (los mismos 8 expertos) cuestan 18,1 ms frente a 7,9 de uno. No ayuda ninguna caché.
+  - En rondas reales los tokens comparten expertos: de 16 rutas con 2 tokens, 13,5 expertos distintos; de 32 con 4, 21,1; de 64 con 8, 31,4.
+- Kernel (`GATHER_QMV_SHARED_SOURCE`):
+  - Un grupo de hilos por ruta y bloque de 8 filas de salida. La primera ruta de cada experto hace el trabajo de todas las que lo usan (como mucho una por token) y las demás salen; las rutas se encuentran con dos votos SIMD (64 rutas como máximo).
+  - Cada bloque de pesos se descodifica una vez y se multiplica por las entradas de cada ruta, de una en una (con todas a la vez en registros se desbordaba).
+  - Reproduce bit a bit el `fp_gather_qmv` de MLX 0.32.4 y su variante rápida, que MLX usa cuando K es múltiplo de 2 · 32 · 32 / bits (de nuestras formas, solo la proyección gate/up de los expertos mxfp8). Se replica el mismo orden de operaciones por carril, el bloque parcial final y que `scale * accum` vaya en su propia sentencia: en una sola expresión el compilador la fusiona en un FMA y redondea distinto.
+  - Comprobado con pesos sintéticos en los tres formatos, nvfp4 con y sin escala global, mxfp4 y mxfp8, con bloques finales completos y parciales (sin códigos NaN en e4m3: un NaN hace que todo dé NaN y la comparación no pruebe nada) y con los expertos del checkpoint de cada tipo de capa.
+- Se usa con 2 a 7 tokens (menos de 64 rutas). Desde 64 rutas MLX ordena las rutas y usa otro kernel que redondea distinto, así que ahí se queda `gather_qmm`; la verificación nunca pasa de 6 tokens. La paridad greedy con la referencia en Python sigue siendo exacta, incluido el prompt de 2.055 tokens, cuyo último trozo de prefill tiene 6.
+- Resultado (expertos sobre las 48 pasadas):
+
+  | Tokens | MLX | K-7 | Tokens idénticos: MLX → K-7 |
+  |---|---|---|---|
+  | 2 | 12,0 ms | 11,2 ms | 11,5 → 8,5 ms |
+  | 4 | 19,4 ms | 17,8 ms | 18,1 → 10,5 ms |
+
+  Forward de verificación con texto real: 2 tokens 38,9 ms (antes 40,8) y 4 tokens 44,3 ms (antes 48,9). Ronda de bloque 4 a 1k: 50,5 ms por 3,1 tokens (antes 53,8).
+- Servidor con la prueba de Ollama (~29k, razonamiento «low», caché bf16, sin caché de prefijos): con drafter 34,7 / 42,9 / 41,5 tok/s (mediana 41,5; antes 35,9), con aceptación del 35–58 %; sin drafter 31,8 tok/s. Ollama hacía 36,7. Primer objetivo de ≥ 40 tok/s a 29k alcanzado en la mediana, aunque depende de la aceptación de cada respuesta.
+- Lo siguiente con más peso: pasar de 1 a 2 tokens añade ~8 ms fuera de los expertos. Casi todo está en las 40 pasadas de ventana. Con más de un token siguen el camino de la referencia, que reordena la ventana y le concatena las claves nuevas: varias copias de ~4 MB por pasada, más un recorte en el siguiente decode. Las proyecciones densas bf16 apenas cuentan (menos de 1 ms).
 
 **Incoherencias a resolver**
 

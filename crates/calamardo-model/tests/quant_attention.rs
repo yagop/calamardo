@@ -599,3 +599,59 @@ fn bench_speculative_attention() {
         });
     }
 }
+
+/// The sliding-window passes with a few queries (verification): the
+/// relative prefill kernel over a 1024-token window, and the split-key
+/// kernel over the same keys. Per pass.
+#[test]
+#[ignore]
+fn bench_window_attention() {
+    use calamardo_model::cache::Packed;
+    use std::time::Instant;
+    let kern = Kernels::new().unwrap();
+    for l in [1, 2, 4, 8] {
+        let s = 1024 + l;
+        let k = bf16(data((HKV * s * D) as usize, 9, 2.0), &[1, HKV, s, D]);
+        let v = bf16(data((HKV * s * D) as usize, 10, 1.0), &[1, HKV, s, D]);
+        let q = bf16(data((HQ * l * D) as usize, 3, 0.2), &[1, HQ, l, D]);
+        let rel = bf16(data((l * HQ * 1024) as usize, 5, 1.0), &[1, l, HQ, 1024]);
+        let sinks = bf16(data((l * HQ) as usize, 7, 1.0), &[1, l, HQ]);
+        let start = ops::broadcast_to(&ops::i32s(0), &[1]).unwrap();
+        ops::eval(&[&k, &v, &q, &rel, &sinks]).unwrap();
+        let time = |f: &dyn Fn() -> Array| {
+            let run = || {
+                let outs: Vec<Array> = (0..40).map(|_| f()).collect();
+                ops::eval(&outs.iter().collect::<Vec<_>>()).unwrap();
+            };
+            run();
+            let t = Instant::now();
+            for _ in 0..10 {
+                run();
+            }
+            t.elapsed().as_secs_f64() * 1e6 / 400.0
+        };
+        let a = time(&|| {
+            kern.relative_attention(&q, &k, &v, &rel, &sinks, 0.088, 1024, &start)
+                .unwrap()
+        });
+        let wrap = |a: &Array| Packed {
+            w: a.clone(),
+            scales: a.clone(),
+            biases: a.clone(),
+        };
+        let b = time(&|| {
+            kern.quantized_decode_attention(
+                &q,
+                &wrap(&k),
+                &wrap(&v),
+                s,
+                &rel,
+                &sinks,
+                0.088,
+                KvFormat::BF16,
+            )
+            .unwrap()
+        });
+        eprintln!("L {l}: relative prefill kernel {a:.1} us · split-key kernel {b:.1} us per pass");
+    }
+}
