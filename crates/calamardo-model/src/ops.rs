@@ -13,6 +13,9 @@ use mlx_sys as sys;
 
 thread_local! {
     static LAST_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The error of a compiled function's body (MLX-C then reports its own,
+    /// generic one through the handler).
+    static CLOSURE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 extern "C" fn on_error(msg: *const c_char, _data: *mut std::ffi::c_void) {
@@ -751,4 +754,114 @@ pub fn addmm(c: &Array, a: &Array, b: &Array) -> Result<Array> {
     op("addmm", |r, s| unsafe {
         sys::mlx_addmm(r, c.as_ptr(), a.as_ptr(), b.as_ptr(), 1.0, 1.0, s)
     })
+}
+
+type CompiledBody = dyn Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync;
+
+/// A function over arrays compiled with `mx.compile` (K-6): its chains of
+/// elementwise ops run as one kernel each, with the same results as the
+/// ops one by one (MLX keeps every op's output dtype and rounding). Traced
+/// once per input shapes and dtypes. The body may only depend on its inputs
+/// and on constants it captures; positions and other per-call values must
+/// come in as arrays, or every call would retrace.
+pub struct Compiled(sys::mlx_closure);
+
+// SAFETY: the closure owns a `Send + Sync` body; MLX-C closures are
+// reference-counted handles, used here from one thread at a time like every
+// other MLX object of the model.
+unsafe impl Send for Compiled {}
+unsafe impl Sync for Compiled {}
+
+impl Compiled {
+    pub fn new(body: impl Fn(&[Array]) -> Result<Vec<Array>> + Send + Sync + 'static) -> Self {
+        unsafe extern "C" fn call(
+            res: *mut sys::mlx_vector_array,
+            input: sys::mlx_vector_array,
+            payload: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: `payload` is the boxed body below, alive while the
+            // closure is; the input handles are retained by the copies.
+            unsafe {
+                let body = &*(payload as *const Box<CompiledBody>);
+                let n = sys::mlx_vector_array_size(input);
+                let args: Vec<Array> = (0..n)
+                    .map(|i| {
+                        let mut a = sys::mlx_array_new();
+                        sys::mlx_vector_array_get(&mut a, input, i);
+                        Array::from_ptr(a)
+                    })
+                    .collect();
+                // A panic must not unwind into C.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&args)))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("compiled function body panicked")));
+                match result {
+                    Ok(outs) => {
+                        let ptrs: Vec<sys::mlx_array> = outs.iter().map(|a| a.as_ptr()).collect();
+                        sys::mlx_vector_array_set_data(res, ptrs.as_ptr(), ptrs.len())
+                    }
+                    Err(e) => {
+                        CLOSURE_ERROR.with(|l| *l.borrow_mut() = Some(format!("{e:#}")));
+                        1
+                    }
+                }
+            }
+        }
+        unsafe extern "C" fn free(payload: *mut std::ffi::c_void) {
+            // SAFETY: created by `Box::into_raw` below and freed once.
+            drop(unsafe { Box::from_raw(payload as *mut Box<CompiledBody>) });
+        }
+        let body: Box<CompiledBody> = Box::new(body);
+        let payload = Box::into_raw(Box::new(body)) as *mut std::ffi::c_void;
+        // SAFETY: the payload lives until MLX-C calls `free`; the plain
+        // closure is retained by the compiled one and released here.
+        unsafe {
+            let f = sys::mlx_closure_new_func_payload(Some(call), payload, Some(free));
+            let mut res = sys::mlx_closure_new();
+            let rc = sys::mlx_compile(&mut res, f, false);
+            sys::mlx_closure_free(f);
+            assert_eq!(rc, 0, "mx.compile of a closure cannot fail");
+            Self(res)
+        }
+    }
+
+    pub fn call(&self, args: &[&Array]) -> Result<Vec<Array>> {
+        let input = Vector::new(args);
+        // SAFETY: borrowed inputs; the result vector is read and freed here.
+        unsafe {
+            let mut out = sys::mlx_vector_array_new();
+            if sys::mlx_closure_apply(&mut out, self.0, input.0) != 0 {
+                sys::mlx_vector_array_free(out);
+                let body = CLOSURE_ERROR.with(|l| l.borrow_mut().take());
+                bail!(
+                    "compiled function failed: {}",
+                    body.unwrap_or_else(last_error)
+                );
+            }
+            let n = sys::mlx_vector_array_size(out);
+            let v = (0..n)
+                .map(|i| {
+                    let mut a = sys::mlx_array_new();
+                    sys::mlx_vector_array_get(&mut a, out, i);
+                    Array::from_ptr(a)
+                })
+                .collect();
+            sys::mlx_vector_array_free(out);
+            Ok(v)
+        }
+    }
+
+    /// For single-output functions.
+    pub fn call1(&self, args: &[&Array]) -> Result<Array> {
+        self.call(args)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("compiled function returned nothing"))
+    }
+}
+
+impl Drop for Compiled {
+    fn drop(&mut self) {
+        // SAFETY: owned and freed once.
+        unsafe { sys::mlx_closure_free(self.0) };
+    }
 }

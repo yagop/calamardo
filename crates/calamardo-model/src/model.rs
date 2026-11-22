@@ -114,7 +114,8 @@ impl QuantizedSwitchLinear {
 
 /// Depthwise causal convolution over the last `kernel_size` tokens.
 struct ShortConvolution {
-    /// (C, K, 1), the checkpoint's (C, 1, K) with the last two axes swapped.
+    /// (C, K, 1), the checkpoint's (C, 1, K) with the last two axes swapped
+    /// (row-contiguous as stored, the size-1 axis aside).
     weight: Array,
     kernel_size: i32,
 }
@@ -122,14 +123,27 @@ struct ShortConvolution {
 impl ShortConvolution {
     fn load(w: &mut Weights, name: &str, kernel_size: i32) -> Result<Self> {
         Ok(Self {
-            weight: ops::swapaxes(&w.take(name)?, 1, 2)?,
+            weight: ops::contiguous(&ops::swapaxes(&w.take(name)?, 1, 2)?)?,
             kernel_size,
         })
     }
 
     /// Returns the output and the window (state + input) for the next state.
-    fn forward(&self, x: &Array, state: Option<&Array>) -> Result<(Array, Array)> {
+    fn forward(&self, kern: &Kernels, x: &Array, state: Option<&Array>) -> Result<(Array, Array)> {
         let k = self.kernel_size;
+        if let Some(state) = state
+            && x.shape()[..2] == [1, 1]
+            && x.dtype() == self.weight.dtype()
+        {
+            // A decode step: one kernel, same results (K-6).
+            let c = self.weight.shape()[0];
+            return kern.short_conv_step(
+                x,
+                state,
+                &ops::reshape(&self.weight, &[c, k])?,
+                ((k + 1) as f64).sqrt() as f32,
+            );
+        }
         let residual = ops::f32(x)?;
         let window = conv_input(x, state, k)?;
         let channels = self.weight.shape()[0];
@@ -214,6 +228,27 @@ fn conv_input(x: &Array, state: Option<&Array>, kernel_size: i32) -> Result<Arra
 enum KvConv {
     Static(ShortConvolution),
     Dynamic(DynamicShortConvolution),
+}
+
+/// `l2_clip` for a few tokens (decode, verification) as one compiled
+/// function per threshold (K-6): the same ops, fused around the sum.
+fn l2_clip_short(
+    kern: &Kernels,
+    x: &Array,
+    scale: Option<&Array>,
+    threshold: f32,
+) -> Result<Array> {
+    if x.shape()[1] > MAX_DECODE_QUERIES {
+        return l2_clip(x, scale, threshold);
+    }
+    let name = format!("l2_clip/{}/{}", threshold.to_bits(), scale.is_some());
+    let f = kern.compiled(&name, || {
+        ops::Compiled::new(move |a: &[Array]| Ok(vec![l2_clip(&a[0], a.get(1), threshold)?]))
+    });
+    match scale {
+        Some(s) => f.call1(&[x, s]),
+        None => f.call1(&[x]),
+    }
 }
 
 /// `_l2_clip`: scales rows of float32 `x * scale` down to an L2 norm of at
@@ -339,6 +374,7 @@ impl Attention {
     ) -> Result<Array> {
         let (key_states, kw) = match &self.k_conv {
             KvConv::Static(c) => c.forward(
+                k,
                 &ops::linear(key_hidden, &self.k_proj)?,
                 cache.conv[0].as_ref(),
             )?,
@@ -350,6 +386,7 @@ impl Attention {
         };
         let (value_states, vw) = match &self.v_conv {
             KvConv::Static(c) => c.forward(
+                k,
                 &ops::linear(value_hidden, &self.v_proj)?,
                 cache.conv[1].as_ref(),
             )?,
@@ -413,10 +450,24 @@ impl Attention {
         let k = ops::reshape(key, &[b, l, self.num_kv_heads, -1])?;
         let v = ops::reshape(value, &[b, l, self.num_kv_heads, -1])?;
         let mut r = ops::reshape(relative, &[b, l, self.num_heads, -1])?;
-        q = l2_clip(&q, Some(&self.q_scale), self.qk_clip)?;
-        let k = l2_clip(&k, None, self.qk_clip)?;
-        let v = ops::astype(&ops::rms_norm(&ops::f32(&v)?, None, self.eps)?, v.dtype())?;
-        r = l2_clip(&r, Some(&self.rel_scale), self.rel_clip)?;
+        q = l2_clip_short(kern, &q, Some(&self.q_scale), self.qk_clip)?;
+        let k = l2_clip_short(kern, &k, None, self.qk_clip)?;
+        let eps = self.eps;
+        let v_norm = move |a: &[Array]| -> Result<Vec<Array>> {
+            Ok(vec![ops::astype(
+                &ops::rms_norm(&ops::f32(&a[0])?, None, eps)?,
+                a[0].dtype(),
+            )?])
+        };
+        let v = if l <= MAX_DECODE_QUERIES {
+            kern.compiled(&format!("v_norm/{}", eps.to_bits()), || {
+                ops::Compiled::new(v_norm)
+            })
+            .call1(&[&v])?
+        } else {
+            v_norm(&[v])?.remove(0)
+        };
+        r = l2_clip_short(kern, &r, Some(&self.rel_scale), self.rel_clip)?;
         if let Some(tau) = tau {
             q = ops::astype(&ops::mul(&ops::f32(&q)?, tau)?, q.dtype())?;
             r = ops::astype(&ops::mul(&ops::f32(&r)?, tau)?, r.dtype())?;
@@ -525,9 +576,19 @@ impl Attention {
             cache.pending = pending;
         }
 
-        let out = ops::f32(&ops::reshape(&out, &[b, l, -1])?)?;
-        let out = ops::mul(&out, &ops::sigmoid(&ops::f32(&gate)?)?)?;
-        ops::linear(&ops::astype(&out, gate.dtype())?, &self.o_proj)
+        let out = ops::reshape(&out, &[b, l, -1])?;
+        let gated = |a: &[Array]| -> Result<Vec<Array>> {
+            let out = ops::mul(&ops::f32(&a[0])?, &ops::sigmoid(&ops::f32(&a[1])?)?)?;
+            Ok(vec![ops::astype(&out, a[1].dtype())?])
+        };
+        let out = if l <= MAX_DECODE_QUERIES {
+            // One compiled function (K-6).
+            kern.compiled("attention_gate", || ops::Compiled::new(gated))
+                .call1(&[&out, &gate])?
+        } else {
+            gated(&[out, gate])?.remove(0)
+        };
+        ops::linear(&out, &self.o_proj)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -565,39 +626,17 @@ impl Attention {
         }
         ensure!(b == 1, "decode supports one sequence");
 
-        // Decode: the fused attention with the bias and window as a mask.
-        let query_positions = ops::add(&ops::arange(0, 1)?, &ops::i32s(end - l))?;
-        let mut key_positions = ops::arange(0, s)?;
-        if let AttnCache::Window(c) = cache {
-            // A decode step writes in place, so the keys can be rotated.
-            key_positions =
-                ops::remainder(&ops::sub(&key_positions, &ops::i32s(c.idx))?, &ops::i32s(s))?;
-        }
-        let key_positions = ops::add(&key_positions, &ops::i32s(end - s))?;
-        let distance = ops::sub(
-            &ops::reshape(&query_positions, &[1])?,
-            &ops::reshape(&key_positions, &[s])?,
-        )?;
+        // Decode: the fused attention with the bias and window as a mask,
+        // built in one kernel (the reference's ops, bit for bit).
         let r = position_bias.shape()[3];
         let pb = ops::slice(&ops::slice(position_bias, 0, 0, 1, 1)?, 1, 0, 1, 1)?;
         let pb = ops::reshape(&pb, &[position_bias.shape()[2], r])?;
-        let bias = ops::take(
-            &pb,
-            &ops::clip(&distance, &ops::i32s(0), &ops::i32s(r - 1))?,
-            -1,
-        )?;
-        let zeros = ops::zeros(bias.shape(), bias.dtype())?;
-        let bias = ops::where_(&ops::less(&distance, &ops::i32s(r))?, &bias, &zeros)?;
-        let mut visible = ops::logical_and(
-            &ops::greater_equal(&distance, &ops::i32s(0))?,
-            &ops::greater_equal(&ops::reshape(&key_positions, &[s])?, &ops::i32s(0))?,
-        )?;
-        if self.window > 0 {
-            visible = ops::logical_and(&visible, &ops::less(&distance, &ops::i32s(self.window))?)?;
-        }
-        let neg_inf = ops::scalar(f32::NEG_INFINITY, bias.dtype())?;
-        let mask = ops::astype(&ops::where_(&visible, &bias, &neg_inf)?, q.dtype())?;
-        let mask = ops::expand_dims(&ops::expand_dims(&mask, &[0])?, &[2])?;
+        let rot = match cache {
+            // A decode step writes in place, so the keys can be rotated.
+            AttnCache::Window(c) => c.idx,
+            _ => 0,
+        };
+        let mask = kern.decode_mask(&pb, s, rot, end, self.window, q.dtype())?;
         let sinks = ops::reshape(
             &ops::slice(&ops::slice(sinks, 0, 0, 1, 1)?, 1, 0, 1, 1)?,
             &[sinks.shape()[2]],
@@ -626,7 +665,27 @@ impl MessageGate {
         })
     }
 
-    fn forward(&self, hidden: &Array, message: &Array) -> Result<Array> {
+    /// A few tokens (decode, verification) go through one compiled
+    /// function (K-6): the same ops with their elementwise chains fused.
+    fn forward(&self, kern: &Kernels, hidden: &Array, message: &Array) -> Result<Array> {
+        if hidden.shape()[1] > MAX_DECODE_QUERIES {
+            return Self::gate(hidden, message, &self.down, &self.forget, &self.message);
+        }
+        let f = kern.compiled("message_gate", || {
+            ops::Compiled::new(|a: &[Array]| {
+                Ok(vec![Self::gate(&a[0], &a[1], &a[2], &a[3], &a[4])?])
+            })
+        });
+        f.call1(&[hidden, message, &self.down, &self.forget, &self.message])
+    }
+
+    fn gate(
+        hidden: &Array,
+        message: &Array,
+        down: &Array,
+        forget: &Array,
+        gain: &Array,
+    ) -> Result<Array> {
         let states = ops::concatenate(
             &[
                 &unweighted_rms_norm(hidden)?,
@@ -634,10 +693,10 @@ impl MessageGate {
             ],
             -1,
         )?;
-        let states = ops::linear(&ops::astype(&states, self.down.dtype())?, &self.down)?;
+        let states = ops::linear(&ops::astype(&states, down.dtype())?, down)?;
         let states = ops::f32(&states)?;
-        let forget = ops::tanh(&ops::linear(&states, &self.forget)?)?;
-        let gain = ops::tanh(&ops::linear(&states, &self.message)?)?;
+        let forget = ops::tanh(&ops::linear(&states, forget)?)?;
+        let gain = ops::tanh(&ops::linear(&states, gain)?)?;
         let kept = ops::mul(&ops::sub(&f32s(1.0), &forget)?, hidden)?;
         ops::add(&kept, &ops::mul(&gain, message)?)
     }
@@ -657,11 +716,12 @@ impl Experts {
             unreachable!()
         };
         let top_k = indices.shape()[2];
-        if b == 1 && (2..=MAX_DECODE_QUERIES).contains(&l) && l * top_k < 64 {
-            // A few tokens (speculative verification, short chunks): each
-            // chosen expert is read once for all its tokens (K-7). Bit for
-            // bit gather_qmm's unsorted path, which the reference takes
-            // below 64 routes (it sorts from 64 on, see below).
+        if b == 1 && (1..=MAX_DECODE_QUERIES).contains(&l) && l * top_k < 64 {
+            // A few tokens (decode, speculative verification, short
+            // chunks): each chosen expert is read once for all its tokens
+            // (K-7; faster than gather_qmm even for one token). Bit for bit
+            // gather_qmm's unsorted path, which the reference takes below
+            // 64 routes (it sorts from 64 on, see below).
             let idx = ops::reshape(indices, &[l, top_k])?;
             let project = |p: &QuantizedSwitchLinear, x: &Array, per_route: bool| {
                 kern.gather_qmv_shared(
@@ -679,7 +739,7 @@ impl Experts {
             let n = gate_up.shape()[1];
             let gate = ops::slice(&gate_up, -1, 0, n, 2)?;
             let up = ops::slice(&gate_up, -1, 1, n, 2)?;
-            let h = softcapped_swiglu(&gate, &up, self.gate_softcap, self.up_softcap)?;
+            let h = self.swiglu_short(kern, &gate, &up)?;
             let out = project(&self.down, &h, true)?;
             return ops::reshape(&out, &[1, l, top_k, -1]);
         }
@@ -701,7 +761,11 @@ impl Experts {
         let n = gate_up.shape()[gate_up.ndim() - 1];
         let gate = ops::slice(&gate_up, -1, 0, n, 2)?;
         let up = ops::slice(&gate_up, -1, 1, n, 2)?;
-        let h = softcapped_swiglu(&gate, &up, self.gate_softcap, self.up_softcap)?;
+        let h = if l <= MAX_DECODE_QUERIES {
+            self.swiglu_short(kern, &gate, &up)?
+        } else {
+            softcapped_swiglu(&gate, &up, self.gate_softcap, self.up_softcap)?
+        };
         let mut out = self.down.forward(&h, &idx, do_sort)?;
         if let Some(inv) = inv_order {
             // `_scatter_unsort`.
@@ -709,6 +773,18 @@ impl Experts {
             out = ops::unflatten(&out, 0, indices.shape())?;
         }
         ops::squeeze(&out, &[-2])
+    }
+}
+
+impl Experts {
+    /// `softcapped_swiglu` as one compiled function (K-6).
+    fn swiglu_short(&self, kern: &Kernels, gate: &Array, up: &Array) -> Result<Array> {
+        let (g, u) = (self.gate_softcap, self.up_softcap);
+        let name = format!("swiglu/{}/{}", g.to_bits(), u.to_bits());
+        kern.compiled(&name, || {
+            ops::Compiled::new(move |a: &[Array]| Ok(vec![softcapped_swiglu(&a[0], &a[1], g, u)?]))
+        })
+        .call1(&[gate, up])
     }
 }
 
@@ -745,12 +821,21 @@ impl Moe {
             self.route_scale,
         )?;
         let expert_states = self.experts.forward(k, hidden, &indices)?;
-        let expert_states = ops::mul(
-            &ops::f32(&expert_states)?,
-            &ops::expand_dims(&weights, &[-1])?,
-        )?;
-        let out = ops::sum(&expert_states, &[-2], false)?;
-        ops::astype(&out, hidden.dtype())
+        let dtype = hidden.dtype();
+        let combine = move |a: &[Array]| -> Result<Vec<Array>> {
+            let states = ops::mul(&ops::f32(&a[0])?, &ops::expand_dims(&a[1], &[-1])?)?;
+            let out = ops::sum(&states, &[-2], false)?;
+            Ok(vec![ops::astype(&out, dtype)?])
+        };
+        if hidden.shape()[1] <= MAX_DECODE_QUERIES {
+            // One compiled function (K-6).
+            k.compiled(&format!("moe_combine/{dtype:?}"), || {
+                ops::Compiled::new(combine)
+            })
+            .call1(&[&expert_states, &weights])
+        } else {
+            Ok(combine(&[expert_states, weights])?.remove(0))
+        }
     }
 }
 
@@ -852,6 +937,7 @@ impl Layer {
 
     fn mix_messages(
         &self,
+        kern: &Kernels,
         q: &Array,
         k: &Array,
         v: &Array,
@@ -865,9 +951,9 @@ impl Layer {
             ops::squeeze(&ops::slice(messages, -2, i, i + 1, 1)?, &[-2])
         };
         Ok([
-            g[0].forward(q, &m(0)?)?,
-            g[1].forward(k, &m(1)?)?,
-            g[2].forward(v, &m(2)?)?,
+            g[0].forward(kern, q, &m(0)?)?,
+            g[1].forward(kern, k, &m(1)?)?,
+            g[2].forward(kern, v, &m(2)?)?,
         ])
     }
 
@@ -898,7 +984,7 @@ impl Layer {
                         [n.clone(), n.clone(), n]
                     }
                     Some(m) => {
-                        let [a, b, c] = self.mix_messages(&h, &h, &h, m)?;
+                        let [a, b, c] = self.mix_messages(kern, &h, &h, &h, m)?;
                         [norm(&a, w)?, norm(&b, w)?, norm(&c, w)?]
                     }
                 };
@@ -914,7 +1000,7 @@ impl Layer {
                     Some(a) => (row(a, 0)?, row(a, 1)?, row(a, 2)?),
                 };
                 if let Some(m) = messages {
-                    [q, k, v] = self.mix_messages(&q, &k, &v, m)?;
+                    [q, k, v] = self.mix_messages(kern, &q, &k, &v, m)?;
                 }
                 self.attn
                     .forward(kern, &norm(&q, wq)?, &norm(&k, wk)?, &norm(&v, wv)?, cache)
@@ -949,7 +1035,7 @@ impl Layer {
         let h = h?;
         let (h, w2) = self
             .post_attention_convolution
-            .forward(&h, cache.conv[2].as_ref())?;
+            .forward(kern, &h, cache.conv[2].as_ref())?;
         cache.conv[2] = Some(w2);
 
         let mut h = ops::f32(&h)?;
@@ -980,7 +1066,11 @@ impl Layer {
         )?;
         if let Some(m) = messages {
             let g = self.message_gates.as_ref().context("message gates")?;
-            h = g[3].forward(&h, &ops::squeeze(&ops::slice(m, -2, 3, 4, 1)?, &[-2])?)?;
+            h = g[3].forward(
+                kern,
+                &h,
+                &ops::squeeze(&ops::slice(m, -2, 3, 4, 1)?, &[-2])?,
+            )?;
         }
         let h = ops::astype(
             &ops::rms_norm(&h, Some(&self.post_attention_layernorm), self.eps)?,
@@ -989,7 +1079,7 @@ impl Layer {
         let h = self.moe.forward(kern, &h)?;
         let (h, w3) = self
             .post_mlp_convolution
-            .forward(&h, cache.conv[3].as_ref())?;
+            .forward(kern, &h, cache.conv[3].as_ref())?;
         cache.conv[3] = Some(w3);
 
         let n = self.post_mlp_convolution.kernel_size - 1;
@@ -1355,5 +1445,93 @@ impl Model {
             ops::slice(&logits, -1, 0, cfg.unpadded_vocab_size as i32, 1)?,
             hidden,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The compiled functions of K-6 against the plain ops, bit for bit.
+    use super::*;
+
+    fn rand(shape: &[i32], seed: u32, amp: f32, dtype: Dtype) -> Array {
+        let n = shape.iter().product::<i32>() as usize;
+        let mut s = seed;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * amp
+            })
+            .collect();
+        ops::astype(&Array::from_slice(&v, shape), dtype).unwrap()
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        let a = ops::f32(a).unwrap();
+        ops::eval(&[&a]).unwrap();
+        a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect()
+    }
+
+    #[test]
+    fn compiled_bodies_match_plain_ops() {
+        ops::init();
+        let kern = Kernels::new().unwrap();
+        let bf = Dtype::Bfloat16;
+        for l in [1, 2, 5, 8] {
+            // l2_clip with and without a scale (q, k, r shapes).
+            let q = rand(&[1, l, 24, 128], 1, 40.0, bf);
+            let scale = rand(&[24, 128], 2, 3.0, bf);
+            for (x, s, t) in [
+                (&q, Some(&scale), 30.0),
+                (&q, None, 30.0),
+                (&q, Some(&scale), 4.0),
+            ] {
+                assert_eq!(
+                    bits(&l2_clip_short(&kern, x, s, t).unwrap()),
+                    bits(&l2_clip(x, s, t).unwrap()),
+                    "l2_clip L {l} threshold {t} scale {}",
+                    s.is_some()
+                );
+            }
+            // The experts' activation.
+            let gate = rand(&[l * 8, 1152], 3, 30.0, bf);
+            let up = rand(&[l * 8, 1152], 4, 30.0, bf);
+            let experts = Experts {
+                gate_up: dummy_switch(),
+                down: dummy_switch(),
+                gate_softcap: 4.0,
+                up_softcap: 25.0,
+            };
+            assert_eq!(
+                bits(&experts.swiglu_short(&kern, &gate, &up).unwrap()),
+                bits(&softcapped_swiglu(&gate, &up, 4.0, 25.0).unwrap()),
+                "swiglu L {l}"
+            );
+            // A message gate.
+            let hidden = rand(&[1, l, 2304], 5, 4.0, Dtype::Float32);
+            let message = rand(&[1, l, 2304], 6, 4.0, Dtype::Float32);
+            let g = MessageGate {
+                down: rand(&[64, 4608], 7, 0.1, bf),
+                forget: rand(&[2304, 64], 8, 0.5, Dtype::Float32),
+                message: rand(&[2304, 64], 9, 0.5, Dtype::Float32),
+            };
+            assert_eq!(
+                bits(&g.forward(&kern, &hidden, &message).unwrap()),
+                bits(
+                    &MessageGate::gate(&hidden, &message, &g.down, &g.forget, &g.message).unwrap()
+                ),
+                "message gate L {l}"
+            );
+        }
+    }
+
+    fn dummy_switch() -> QuantizedSwitchLinear {
+        QuantizedSwitchLinear {
+            weight: Array::from_slice(&[0u32], &[1, 1, 1]),
+            scales: Array::from_slice(&[0u8], &[1, 1, 1]),
+            global_scale: None,
+            group_size: 16,
+            bits: 4,
+            mode: c"nvfp4",
+        }
     }
 }

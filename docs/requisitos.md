@@ -444,6 +444,26 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
   Con K-7 y sin este cambio: 44,3, 50,5 y 69,2 ms a 1k; 47,4, 53,5 y 73,2 ms a 31k.
 - Servidor con la prueba de Ollama (~29k, razonamiento «low», caché bf16): con drafter 39,2 / 52,9 / 51,5 tok/s (mediana 51,5; antes 41,5) con aceptación del 36–60 %; sin drafter 31,9. Ollama hacía 36,7.
 
+**K-6: menos lanzamientos por token (22 de noviembre de 2026)**
+
+- Perfil de un decode (1k de contexto, caché bf16; `bench_decode_profile`, hecho con un subagente):
+  - 28,1 ms por token y **9.133 kernels de GPU**. Dos tercios son operaciones elementales sueltas; 2.692 son conversiones de tipo.
+  - La CPU tarda 3 ms en construir el grafo y ~21 en codificarlo y enviarlo (unos 180 búferes de comandos). La GPU tarda 24,2 ms, unos 10 de ellos en latencia de lanzamientos pequeños.
+  - El suelo por ancho de banda es de ~10 ms (unos 5,2 GB leídos por token) y, con las velocidades reales de los productos grandes, ~13 ms.
+- Herramientas: MLX-C trae `mlx_export_to_dot` (el grafo perezoso, para contar nodos), `mlx_metal_start_capture` (requiere Xcode para leer la traza, no disponible) y `mlx_compile`. `ops::Compiled` envuelve este último: funciona desde Rust y da los mismos resultados bit a bit, porque cada operación conserva su tipo de salida. Solo fusiona cadenas elementales (normas, productos, concatenaciones y convoluciones quedan aparte). Se usa solo con 1 a 8 tokens, para no trazar de nuevo cada tamaño de trozo de prefill, y las posiciones nunca son constantes dentro de una función compilada.
+- Hecho, todo exacto (tests bit a bit frente a las operaciones que sustituye y paridad greedy con la referencia en Python):
+  - Máscara de la atención en decode: un kernel en vez de ~30 operaciones por pasada. Solo selecciona y copia valores bf16.
+  - Convoluciones cortas estáticas en decode: un kernel que forma la ventana, hace la convolución depthwise como el `depthwise_conv_1d` de MLX (mismo orden por tap; los productos bf16 × bf16 son exactos en float), añade el residuo y escala. El estado siguiente sale de un solo kernel (`x · 1`, valores idénticos) en vez de `arange` + `take_along_axis`. `mx.copy` no sirve: comparte el búfer y mantendría viva toda la ventana (en prefill, ~2,6 GB retenidos).
+  - Compilados: recortes L2, puertas de mensajes, activación de los expertos, combinación de expertos, puerta de la atención y la norma de v.
+  - K-7 también para un solo token: idéntico a `gather_qmm` y algo más rápido.
+- Resultado: 4.349 kernels por token (antes 9.133). Decode a 1k: 22,8 ms (antes 28,9); a 31k: 24,9 ms (antes 30,8). Tiempo de GPU por token: 21,6 ms (antes 24,2). Rondas a 31k: bloque 2 en 37,4 ms y bloque 4 en 44,0 ms (antes 41,4 y 48,3).
+- Servidor con la prueba de Ollama (~29k, razonamiento «low», caché bf16): sin drafter 39,6 tok/s en las tres peticiones (antes 31,9; +24 %); con drafter 49,3 / 47,2 / 59,6 (mediana 49,3, aceptación del 42–55 %; con drafter la cifra depende sobre todo de la aceptación de cada respuesta).
+- Ahora manda la GPU: la CPU ya no es el límite. Lo que queda:
+  - Unos 4.000 kernels pequeños: conversiones de tipo, normas, sumas, copias y concatenaciones entre la atención y el MoE.
+  - Expertos a ~285 GB/s frente a ~440 de las proyecciones densas.
+  - Juntar las proyecciones con la misma entrada (q, r y puerta; también k y v en las ventanas sin mensajes). En decode es exacto: MLX elige la misma variante de `gemv` para esos tamaños, pero no para la de sumideros (N = 24), y en prefill cambia el tiling.
+  - La atención en profundidad (~8 µs por llamada).
+
 **Incoherencias a resolver**
 
 1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k. Resuelto en la práctica: Calamardo hace 401 tok/s a 145k y 5,3 min en frío.

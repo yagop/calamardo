@@ -887,6 +887,64 @@ const GATHER_QMV_SHARED_SOURCE: &str = r#"
     }
 "#;
 
+// K-6: the additive mask of a decode step's attention (MLX's fused SDPA), in
+// one dispatch instead of the ~30 small ops that build it: for key slot j
+// (rotated by `rot` in a sliding window's ring buffer) at position kp, the
+// query at end - 1 sees it if 0 <= distance, kp >= 0 and (no window or
+// distance < window); then the value is the relative bias at that distance
+// (0 from R on), else -inf. Only selections and copies of bfloat values, so
+// the mask is the one the ops build, bit for bit.
+const DECODE_MASK_SOURCE: &str = r#"
+    const int j = int(thread_position_in_grid.x);
+    const int h = int(thread_position_in_grid.y);
+    const int s = params[0];
+    const int rot = params[1];
+    const int end = params[2];
+    const int window = params[3];
+    if (j >= s) {
+        return;
+    }
+    int slot = (j - rot) % s;
+    if (slot < 0) {
+        slot += s;
+    }
+    const int kp = slot + end - s;
+    const int dist = end - 1 - kp;
+    const bool visible = dist >= 0 && kp >= 0 && (window == 0 || dist < window);
+    T out;
+    if (!visible) {
+        out = T(-INFINITY);
+    } else if (dist < R) {
+        out = T(pb[size_t(h) * R + dist]);
+    } else {
+        out = T(0.0f);
+    }
+    mask[size_t(h) * s + j] = out;
+"#;
+
+// K-6: a decode step of a static short convolution in one dispatch: the
+// window (float state rows, then the input), MLX's depthwise conv1d over it
+// in bfloat (`acc += float(in) * w` tap by tap, as its depthwise_conv_1d
+// kernel; products of two bfloats are exact in float, so only this order
+// matters), the residual and the scaling, as the ops do one by one.
+// Outputs the result and the window (for the next state).
+const SHORT_CONV_SOURCE: &str = r#"
+    const int c = int(thread_position_in_grid.x);
+    if (c >= C) {
+        return;
+    }
+    const float xf = float(x[c]);
+    float acc = 0.0f;
+    for (int i = 0; i < K; i++) {
+        const float v = i < K - 1 ? state[i * C + c] : xf;
+        win[i * C + c] = v;
+        acc += float(T(v)) * float(w[c * K + i]);
+    }
+    const float conv = float(T(acc));
+    const float y = conv + xf;
+    out[c] = T(y / denom);
+"#;
+
 /// Most key parts per KV head of the quantized decode attention (K-4). On M4
 /// Max, 512 parts of this kernel beat the 64 that suit MLX's own attention
 /// (1.38 vs 2.08 ms per pass at 160k tokens, see `bench_decode_160k`).
@@ -1016,6 +1074,8 @@ pub struct Kernels {
     relative_quant: MetalKernel,
     gather_qmv_shared: MetalKernel,
     window_verify: MetalKernel,
+    decode_mask: MetalKernel,
+    short_conv: MetalKernel,
     /// Key parts per KV head of the quantized decode attention; 0 adapts to
     /// the context length.
     pub decode_parts: i32,
@@ -1028,6 +1088,8 @@ pub struct Kernels {
     pub matrix_decode_from: i32,
     /// Key parts per KV head of the window verification; 0 adapts.
     pub window_parts: i32,
+    /// Functions compiled with `mx.compile` (K-6), by name.
+    compiled: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<ops::Compiled>>>,
 }
 
 impl Kernels {
@@ -1103,6 +1165,20 @@ impl Kernels {
                 &quant_relative_source()?,
                 MetalKernelOptions::default(),
             ))?,
+            short_conv: ops::with_mlx_message(MetalKernel::new(
+                "short_conv_step",
+                &["x", "state", "w", "denom"],
+                &["out", "win"],
+                SHORT_CONV_SOURCE,
+                contiguous.clone(),
+            ))?,
+            decode_mask: ops::with_mlx_message(MetalKernel::new(
+                "decode_mask",
+                &["pb", "params"],
+                &["mask"],
+                DECODE_MASK_SOURCE,
+                contiguous.clone(),
+            ))?,
             window_verify: ops::with_mlx_message(MetalKernel::new(
                 "window_verify_partial",
                 &["q", "kw", "vw", "nk", "nv", "rel", "sizes", "scale"],
@@ -1128,6 +1204,7 @@ impl Kernels {
             // contexts (see bench_speculative_attention).
             matrix_decode_from: 256 * 1024,
             window_parts: 0,
+            compiled: Default::default(),
         })
     }
 
@@ -1701,6 +1778,116 @@ impl Kernels {
                         int("XR", x_per_route as i32),
                         int("HAS_GS", global_scale.is_some() as i32),
                     ],
+                    ..Default::default()
+                },
+            ))?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+
+    /// The compiled function `name`, built by `build` on first use.
+    pub fn compiled(
+        &self,
+        name: &str,
+        build: impl FnOnce() -> ops::Compiled,
+    ) -> std::sync::Arc<ops::Compiled> {
+        let mut map = self.compiled.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(name.to_string())
+            .or_insert_with(|| std::sync::Arc::new(build()))
+            .clone()
+    }
+
+    /// One decode step of a static short convolution (K-6): x (1, 1, C) in
+    /// the weights' dtype, state (1, K - 1, C) float32, weight (C, K)
+    /// contiguous. Returns the output (1, 1, C) and the window (1, K, C)
+    /// float32, as `ShortConvolution::forward` computes them.
+    pub fn short_conv_step(
+        &self,
+        x: &Array,
+        state: &Array,
+        weight: &Array,
+        denom: f32,
+    ) -> Result<(Array, Array)> {
+        let [c, k] = weight.shape()[..] else {
+            anyhow::bail!("short convolution weight must be (C, K)")
+        };
+        anyhow::ensure!(
+            x.shape() == [1, 1, c]
+                && x.dtype() == weight.dtype()
+                && state.shape() == [1, k - 1, c]
+                && state.dtype() == Dtype::Float32,
+            "short convolution step: x {:?}, state {:?}, weight {:?}",
+            x.shape(),
+            state.shape(),
+            weight.shape()
+        );
+        let denom = f32s(denom);
+        // SAFETY: one thread per channel; reads and writes inside the
+        // shapes checked above.
+        let mut out = unsafe {
+            ops::with_mlx_message(self.short_conv.apply(
+                &[x, state, weight, &denom],
+                &[
+                    MetalKernelOutput {
+                        shape: vec![1, 1, c],
+                        dtype: x.dtype(),
+                    },
+                    MetalKernelOutput {
+                        shape: vec![1, k, c],
+                        dtype: Dtype::Float32,
+                    },
+                ],
+                (c, 1, 1),
+                (c.min(256), 1, 1),
+                MetalKernelApplyOptions {
+                    template_args: vec![
+                        ("T".to_string(), TemplateArg::Dtype(x.dtype())),
+                        int("C", c),
+                        int("K", k),
+                    ],
+                    ..Default::default()
+                },
+            ))?
+        }
+        .into_iter();
+        Ok((out.next().unwrap(), out.next().unwrap()))
+    }
+
+    /// The additive attention mask (1, Hq, 1, s) of one decode query over
+    /// `s` key slots, in `dtype` (K-6). pb: the relative bias (Hq, R) of
+    /// the query; `rot`: the next write slot of a sliding window's ring
+    /// buffer (0 for a global cache); `end`: tokens in the cache including
+    /// the query; `window`: 0 for none.
+    pub fn decode_mask(
+        &self,
+        pb: &Array,
+        s: i32,
+        rot: i32,
+        end: i32,
+        window: i32,
+        dtype: Dtype,
+    ) -> Result<Array> {
+        let [hq, r] = pb.shape()[..] else {
+            anyhow::bail!("relative bias must be (Hq, R)")
+        };
+        anyhow::ensure!(
+            s > 0 && (0..=s).contains(&rot),
+            "decode mask over {s} slots, rotation {rot}"
+        );
+        let params = Array::from_slice(&[s, rot, end, window], &[4]);
+        // SAFETY: one thread per (slot, head); reads pb (Hq, R) at distances
+        // below R and writes inside (Hq, s).
+        let out = unsafe {
+            ops::with_mlx_message(self.decode_mask.apply(
+                &[pb, &params],
+                &[MetalKernelOutput {
+                    shape: vec![1, hq, 1, s],
+                    dtype,
+                }],
+                (s, hq, 1),
+                (s.min(256), 1, 1),
+                MetalKernelApplyOptions {
+                    template_args: vec![("T".to_string(), TemplateArg::Dtype(dtype)), int("R", r)],
                     ..Default::default()
                 },
             ))?

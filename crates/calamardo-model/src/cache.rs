@@ -496,8 +496,10 @@ impl PassCache {
 /// does not keep the window alive (`_conv_state` with no lengths).
 pub fn conv_state(window: &Array, n: i32) -> Result<Array> {
     let w = window.shape()[1];
-    let pos = ops::reshape(&ops::arange(w - n, w)?, &[1, n, 1])?;
-    ops::take_along_axis(window, &pos, 1)
+    // A new buffer in one kernel (K-6), with the values `take_along_axis`
+    // gives: x * 1 is x for every float, -0 and NaN included. (`mx.copy`
+    // would share the window's buffer and keep it alive.)
+    ops::mul(&ops::slice(window, 1, w - n, w, 1)?, &ops::f32s(1.0))
 }
 
 /// What one pass needs to return to an earlier point of the same sequence.
