@@ -737,24 +737,79 @@ impl Attention {
 /// `MessageGate`: mixes the loop message into a stream.
 struct MessageGate {
     down: Array,
-    /// float32.
+    /// float32. A view of `fg`'s first rows.
     forget: Array,
-    /// float32.
+    /// float32. A view of `fg`'s last rows.
     message: Array,
+    /// float32 (2 D, r): the forget and gain projections stacked, one gemv
+    /// for both in decode (K-6; MLX reduces each row the same way for
+    /// these sizes, as K <= 64).
+    fg: Array,
 }
 
 impl MessageGate {
     fn load(w: &mut Weights, p: &str) -> Result<Self> {
+        let down = w.take(&format!("{p}.down_weight"))?;
+        let forget = ops::f32(&w.take(&format!("{p}.forget_weight"))?)?;
+        let gain = ops::f32(&w.take(&format!("{p}.gain_weight"))?)?;
+        Self::from_parts(down, &forget, &gain)
+    }
+
+    fn from_parts(down: Array, forget: &Array, gain: &Array) -> Result<Self> {
+        let n = forget.shape()[0];
+        let fg = ops::concatenate(&[forget, gain], 0)?;
         Ok(Self {
-            down: w.take(&format!("{p}.down_weight"))?,
-            forget: ops::f32(&w.take(&format!("{p}.forget_weight"))?)?,
-            message: ops::f32(&w.take(&format!("{p}.gain_weight"))?)?,
+            down,
+            forget: ops::slice(&fg, 0, 0, n, 1)?,
+            message: ops::slice(&fg, 0, n, 2 * n, 1)?,
+            fg,
         })
     }
 
-    /// A few tokens (decode, verification) go through one compiled
-    /// function (K-6): the same ops with their elementwise chains fused.
+    /// One decode token: the forget and gain projections in one gemv, and
+    /// the elementwise tail compiled (K-6). The same values as `gate`.
+    fn forward_one(&self, kern: &Kernels, hidden: &Array, message: &Array) -> Result<Array> {
+        let states = Self::states(hidden, message, &self.down)?;
+        let fg = ops::linear(&states, &self.fg)?;
+        Self::mix(kern, &fg, hidden, message)
+    }
+
+    /// The down projection of the normed hidden state and message, as
+    /// float32.
+    fn states(hidden: &Array, message: &Array, down: &Array) -> Result<Array> {
+        let states = ops::concatenate(
+            &[
+                &unweighted_rms_norm(hidden)?,
+                &unweighted_rms_norm(message)?,
+            ],
+            -1,
+        )?;
+        let states = ops::linear(&ops::astype(&states, down.dtype())?, down)?;
+        ops::f32(&states)
+    }
+
+    /// `(1 - tanh(forget)) * hidden + tanh(gain) * message`, with forget
+    /// and gain the two halves of `fg`'s last axis; compiled.
+    fn mix(kern: &Kernels, fg: &Array, hidden: &Array, message: &Array) -> Result<Array> {
+        kern.compiled("message_gate_mix", || {
+            ops::Compiled::new(|a: &[Array]| {
+                let n = a[0].shape()[a[0].ndim() - 1] / 2;
+                let forget = ops::tanh(&ops::slice(&a[0], -1, 0, n, 1)?)?;
+                let gain = ops::tanh(&ops::slice(&a[0], -1, n, 2 * n, 1)?)?;
+                let kept = ops::mul(&ops::sub(&f32s(1.0), &forget)?, &a[1])?;
+                Ok(vec![ops::add(&kept, &ops::mul(&gain, &a[2])?)?])
+            })
+        })
+        .call1(&[fg, hidden, message])
+    }
+
+    /// One token goes through `forward_one`; a few (verification, short
+    /// chunks) through one compiled function (K-6): the same ops with their
+    /// elementwise chains fused.
     fn forward(&self, kern: &Kernels, hidden: &Array, message: &Array) -> Result<Array> {
+        if hidden.shape()[..2] == [1, 1] {
+            return self.forward_one(kern, hidden, message);
+        }
         if hidden.shape()[1] > MAX_DECODE_QUERIES {
             return Self::gate(hidden, message, &self.down, &self.forget, &self.message);
         }
@@ -786,6 +841,65 @@ impl MessageGate {
         let gain = ops::tanh(&ops::linear(&states, gain)?)?;
         let kept = ops::mul(&ops::sub(&f32s(1.0), &forget)?, hidden)?;
         ops::add(&kept, &ops::mul(&gain, message)?)
+    }
+}
+
+/// The q, k and v message gates of a core layer with their weights stacked:
+/// one batched gemv per projection for the three in decode (K-6). MLX runs
+/// each batch element through the same gemv as alone, so the values are
+/// the same; the gates' own weights are views of these stacks.
+struct GateStack {
+    /// (3, r, 2 D).
+    down: Array,
+    /// float32 (3, 2 D, r).
+    fg: Array,
+}
+
+impl GateStack {
+    /// Stacks the first three gates and makes their weights views of the
+    /// stacks.
+    fn new(gates: &mut [MessageGate; 4]) -> Result<Self> {
+        let down = ops::stack(&gates[..3].iter().map(|g| &g.down).collect::<Vec<_>>(), 0)?;
+        let fg = ops::stack(&gates[..3].iter().map(|g| &g.fg).collect::<Vec<_>>(), 0)?;
+        for (i, g) in gates[..3].iter_mut().enumerate() {
+            let i = i as i32;
+            let n = g.forget.shape()[0];
+            g.down = ops::squeeze(&ops::slice(&down, 0, i, i + 1, 1)?, &[0])?;
+            g.fg = ops::squeeze(&ops::slice(&fg, 0, i, i + 1, 1)?, &[0])?;
+            g.forget = ops::slice(&g.fg, 0, 0, n, 1)?;
+            g.message = ops::slice(&g.fg, 0, n, 2 * n, 1)?;
+        }
+        Ok(Self { down, fg })
+    }
+
+    /// The three gates for one decode token: hidden states and messages
+    /// (1, 1, D) each, float32.
+    fn forward(
+        &self,
+        kern: &Kernels,
+        hidden: [&Array; 3],
+        message: [&Array; 3],
+    ) -> Result<[Array; 3]> {
+        let d = hidden[0].shape()[2];
+        let stack =
+            |xs: [&Array; 3]| -> Result<Array> { ops::reshape(&ops::stack(&xs, 0)?, &[3, 1, d]) };
+        let (h, m) = (stack(hidden)?, stack(message)?);
+        let states = ops::concatenate(&[&unweighted_rms_norm(&h)?, &unweighted_rms_norm(&m)?], -1)?;
+        let states = ops::matmul(
+            &ops::astype(&states, self.down.dtype())?,
+            &ops::transpose(&self.down, &[0, 2, 1])?,
+        )?;
+        let states = ops::f32(&states)?;
+        let fg = ops::matmul(&states, &ops::transpose(&self.fg, &[0, 2, 1])?)?;
+        let out = MessageGate::mix(kern, &fg, &h, &m)?;
+        let row = |i: i32| -> Result<Array> {
+            ops::reshape(&ops::slice(&out, 0, i, i + 1, 1)?, &[1, 1, d])
+        };
+        Ok([row(0)?, row(1)?, row(2)?])
+    }
+
+    fn arrays(&self) -> [&Array; 2] {
+        [&self.down, &self.fg]
     }
 }
 
@@ -981,6 +1095,8 @@ struct Layer {
     moe: Moe,
     /// q, k, v and mlp gates, only in the loop core.
     message_gates: Option<[MessageGate; 4]>,
+    /// The q, k and v gates stacked, in the loop core.
+    qkv_gates: Option<GateStack>,
     eps: f32,
 }
 
@@ -1010,7 +1126,7 @@ impl Layer {
             }
         };
         let core = cfg.loop_config.core_start..cfg.loop_config.core_end;
-        let message_gates = if core.contains(&i) {
+        let mut message_gates = if core.contains(&i) {
             let c = format!("{p}.controllers");
             Some([
                 MessageGate::load(w, &format!("{c}.attn"))?,
@@ -1020,6 +1136,10 @@ impl Layer {
             ])
         } else {
             None
+        };
+        let qkv_gates = match message_gates.as_mut() {
+            Some(g) => Some(GateStack::new(g)?),
+            None => None,
         };
         let e = format!("{p}.mlp.experts");
         Ok(Self {
@@ -1053,6 +1173,7 @@ impl Layer {
                 route_scale: cfg.route_scale,
             },
             message_gates,
+            qkv_gates,
             eps: cfg.rms_norm_eps,
         })
     }
@@ -1072,6 +1193,11 @@ impl Layer {
         let m = |i: i32| -> Result<Array> {
             ops::squeeze(&ops::slice(messages, -2, i, i + 1, 1)?, &[-2])
         };
+        if let Some(stack) = &self.qkv_gates
+            && q.shape()[..2] == [1, 1]
+        {
+            return stack.forward(kern, [q, k, v], [&m(0)?, &m(1)?, &m(2)?]);
+        }
         Ok([
             g[0].forward(kern, q, &m(0)?)?,
             g[1].forward(kern, k, &m(1)?)?,
@@ -1277,8 +1403,11 @@ impl Layer {
                 KvConv::Dynamic(d) => v.extend([&d.static_weight, &d.weight_proj]),
             }
         }
+        for s in self.qkv_gates.iter() {
+            v.extend(s.arrays());
+        }
         for g in self.message_gates.iter().flatten() {
-            v.extend([&g.down, &g.forget, &g.message]);
+            v.extend([&g.fg, &g.down, &g.forget, &g.message]);
         }
         v.extend(self.moe.experts.gate_up.arrays());
         v.extend(self.moe.experts.down.arrays());
@@ -1655,17 +1784,80 @@ mod tests {
             // A message gate.
             let hidden = rand(&[1, l, 2304], 5, 4.0, Dtype::Float32);
             let message = rand(&[1, l, 2304], 6, 4.0, Dtype::Float32);
-            let g = MessageGate {
-                down: rand(&[64, 4608], 7, 0.1, bf),
-                forget: rand(&[2304, 64], 8, 0.5, Dtype::Float32),
-                message: rand(&[2304, 64], 9, 0.5, Dtype::Float32),
-            };
+            let (gd, gf, gg) = (
+                rand(&[64, 4608], 7, 0.1, bf),
+                rand(&[2304, 64], 8, 0.5, Dtype::Float32),
+                rand(&[2304, 64], 9, 0.5, Dtype::Float32),
+            );
+            let g = MessageGate::from_parts(gd.clone(), &gf, &gg).unwrap();
             assert_eq!(
                 bits(&g.forward(&kern, &hidden, &message).unwrap()),
                 bits(
                     &MessageGate::gate(&hidden, &message, &g.down, &g.forget, &g.message).unwrap()
                 ),
                 "message gate L {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_message_gates_match_plain_ops() {
+        ops::init();
+        let kern = Kernels::new().unwrap();
+        let bf = Dtype::Bfloat16;
+        // The reference uses the raw weights, not views of the stacks.
+        let plain: Vec<(Array, Array, Array)> = (0..4u32)
+            .map(|i| {
+                (
+                    rand(&[64, 4608], 20 + i, 0.1, bf),
+                    rand(&[2304, 64], 30 + i, 0.5, Dtype::Float32),
+                    rand(&[2304, 64], 40 + i, 0.5, Dtype::Float32),
+                )
+            })
+            .collect();
+        let mut gates: [MessageGate; 4] = std::array::from_fn(|i| {
+            let (d, f, g) = &plain[i];
+            MessageGate::from_parts(d.clone(), f, g).unwrap()
+        });
+        let stack = GateStack::new(&mut gates).unwrap();
+        let h: Vec<Array> = (0..3)
+            .map(|i| rand(&[1, 1, 2304], 50 + i, 4.0, Dtype::Float32))
+            .collect();
+        let m: Vec<Array> = (0..3)
+            .map(|i| rand(&[1, 1, 2304], 60 + i, 4.0, Dtype::Float32))
+            .collect();
+        let want: Vec<Vec<u32>> = (0..3)
+            .map(|i| {
+                let (d, f, g) = &plain[i];
+                bits(&MessageGate::gate(&h[i], &m[i], d, f, g).unwrap())
+            })
+            .collect();
+        let got = stack
+            .forward(&kern, [&h[0], &h[1], &h[2]], [&m[0], &m[1], &m[2]])
+            .unwrap();
+        for i in 0..3 {
+            assert_eq!(bits(&got[i]), want[i], "stacked gate {i}");
+            assert_eq!(
+                bits(&gates[i].forward(&kern, &h[i], &m[i]).unwrap()),
+                want[i],
+                "gate {i} alone"
+            );
+        }
+        let (d, f, g) = &plain[3];
+        assert_eq!(
+            bits(&gates[3].forward(&kern, &h[0], &m[0]).unwrap()),
+            bits(&MessageGate::gate(&h[0], &m[0], d, f, g).unwrap()),
+            "mlp gate"
+        );
+        // Several tokens (compiled path, then plain ops) over the stacked views.
+        for l in [2, 9] {
+            let hl = rand(&[1, l, 2304], 70, 4.0, Dtype::Float32);
+            let ml = rand(&[1, l, 2304], 71, 4.0, Dtype::Float32);
+            let (d, f, g) = &plain[1];
+            assert_eq!(
+                bits(&gates[1].forward(&kern, &hl, &ml).unwrap()),
+                bits(&MessageGate::gate(&hl, &ml, d, f, g).unwrap()),
+                "gate 1 over {l} tokens"
             );
         }
     }

@@ -473,6 +473,15 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
 - Resultado: 3.790 kernels por token. Decode a 1k: 22,4 ms; a 31k: 24,7 ms. Tiempo de GPU por paso: 20,4 ms (unos 13,4 en los productos grandes y unos 7 en los ~3.500 kernels pequeños que quedan). Quitar más kernels pequeños ya rinde poco, ~1 µs cada uno.
 - Perfiles sin Xcode: la captura de GPU de MLX (`MTL_CAPTURE_ENABLED=1`) funciona y el reproductor de Apple (`MTLReplayer.app`) viene con macOS. Con gputrace-rs se obtienen kernels y despachos reales, pero los tiempos por kernel necesitan el modelo de costes de Xcode y las cifras por shader sin él no son fiables. El test ignorado `capture_decode_step` captura un paso de decode por si algún día se instala Xcode.
 
+**K-6, tercera ronda (22 de noviembre de 2026)**
+
+- Puertas de mensajes en decode:
+  - Las proyecciones de olvido y ganancia de cada puerta van en un solo gemv (N = 4.608, K = 64): MLX usa la misma variante que con N = 2.304, porque K ≤ 64.
+  - Las tres puertas de q, k y v van en un producto por lotes, con pesos apilados al cargar (los de cada puerta son vistas, sin duplicar memoria).
+  - Bit a bit (test frente a las operaciones originales) y con paridad exacta con la referencia.
+- 3.358 kernels por token (antes 3.790), pero el tiempo apenas cambia: decode 22,2 ms y GPU 20,2 ms (antes 20,4). Los kernels pequeños que quedan casi siempre se solapan con otros, porque MLX lanza en paralelo las operaciones independientes. Lo que marca el tiempo ahora es la cadena de operaciones dependientes de cada pasada y los productos grandes, no el número de kernels.
+- Conclusión: quitar kernels sueltos ya no rinde. Lo que queda por ganar en decode requiere acortar la cadena dependiente (núcleos que fusionen norma, conversión y producto, o pasadas enteras), dejar de reproducir bit a bit a MLX en los expertos, o cambiar la precisión de las capas densas.
+
 **Incoherencias a resolver**
 
 1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k. Resuelto en la práctica: Calamardo hace 401 tok/s a 145k y 5,3 min en frío.
