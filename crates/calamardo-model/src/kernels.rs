@@ -493,6 +493,195 @@ const QUANT_DECODE_REDUCE_SOURCE: &str = r#"
     }
 "#;
 
+// Pass 1 of the same attention for several queries (speculative
+// verification, the drafter's block) with simdgroup matrices. The per-lane
+// kernel above keeps G * L query rows in registers and spills from 2 queries
+// on (8-bit at 516k tokens: 3.6 ms per pass for one query, 16.7 for 3, 168
+// for 7). Here one simdgroup handles 8 query rows over one key part of one
+// KV head, KS keys per step, and reads the keys and values straight from the
+// cache into its matrix registers, dequantized as above (exactly
+// `mx.dequantize`): no threadgroup memory or barriers, so many simdgroups
+// stay in flight to hide the memory latency (staging tiles in threadgroup
+// memory was 2-4x slower). Scores come from 8x8 float matrix products, the
+// online softmax runs on the score registers and P V accumulates into the
+// output tiles: 3.0 ms for 2 queries, 4.6 for 3-5, 6.6 for 7 (see
+// bench_speculative_attention). The loops over the head dimension must stay
+// fully unrolled: an index into the matrix arrays that is not a constant
+// sends them to memory (4-5x slower). The partial results have the layout of
+// the per-lane kernel, so the same pass 2 merges them. CAUSAL = 0 lets every
+// query see every key (the drafter's bidirectional block); R = 0 skips the
+// bias.
+const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
+    constexpr float LOG2E = 1.4426950408889634f;
+    constexpr int GL = G * L;
+    constexpr int ROW_BYTES = D * BITS / 8;
+    constexpr int NG = BITS == 16 ? 1 : D / GROUP;
+    constexpr int HQ = HKV * G;
+    constexpr int DT = D / 8;              // 8-wide tiles along a row
+    constexpr int MASK = BITS == 16 ? 0 : (1 << BITS) - 1;
+    const int S = sizes[0];
+    const int cap = sizes[1];
+    const int part = threadgroup_position_in_grid.x;
+    const int kvh = threadgroup_position_in_grid.y;
+    const int sg = int(simdgroup_index_in_threadgroup);
+    const int lane = int(thread_index_in_simdgroup);
+
+    // This lane's two elements of every 8x8 matrix: row fm, columns fn and
+    // fn + 1 (the simdgroup matrix layout). The lanes of a row differ in
+    // bits 0 and 3.
+    const int fm = ((lane / 4) & 4) + ((lane / 2) % 4);
+    const int fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const int qr = sg * 8 + fm;            // this lane's query row
+    const bool row_ok = qr < GL;
+    const int hr = row_ok ? kvh * G + qr / L : 0;
+    const int lr = row_ok ? qr % L : 0;
+    const int pos = S - L + lr;            // position of the row's query
+
+    simdgroup_matrix<float, 8, 8> qf[DT];
+    simdgroup_matrix<float, 8, 8> o[DT];
+    _Pragma("clang loop unroll(full)")
+    for (int d = 0; d < DT; d++) {
+        const device T* qp = q + (size_t(hr) * L + lr) * D + d * 8 + fn;
+        qf[d].thread_elements()[0] = row_ok ? float(qp[0]) : 0.0f;
+        qf[d].thread_elements()[1] = row_ok ? float(qp[1]) : 0.0f;
+        o[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = -INFINITY;
+    float ssum = 0.0f;
+
+    const device uint8_t* kbytes = (const device uint8_t*)kw + size_t(kvh) * cap * ROW_BYTES;
+    const device uint8_t* vbytes = (const device uint8_t*)vw + size_t(kvh) * cap * ROW_BYTES;
+    const device T* ksc = ks + size_t(kvh) * cap * NG;
+    const device T* kbi = kb + size_t(kvh) * cap * NG;
+    const device T* vsc = vs + size_t(kvh) * cap * NG;
+    const device T* vbi = vb + size_t(kvh) * cap * NG;
+
+    const int per = (S + NB - 1) / NB;
+    const int j0 = part * per;
+    const int j1 = min(S, j0 + per);
+    constexpr int DG = BITS == 16 ? DT : GROUP / 8; // 8-wide tiles per quantization group
+    for (int jt = j0; jt < j1; jt += KS) {
+        simdgroup_matrix<float, 8, 8> sc[KS / 8];
+        float tmax = -INFINITY;
+        _Pragma("clang loop unroll(full)")
+        for (int c8 = 0; c8 < KS / 8; c8++) {
+            // Keys of this lane's K^T elements (fn, fn + 1), clamped to the
+            // part: out-of-range keys get a -inf score below.
+            const int ka = min(jt + c8 * 8 + fn, j1 - 1);
+            const int kb2 = min(jt + c8 * 8 + fn + 1, j1 - 1);
+            const device uint8_t* ra = kbytes + size_t(ka) * ROW_BYTES;
+            const device uint8_t* rb = kbytes + size_t(kb2) * ROW_BYTES;
+            sc[c8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            float sa = 0.0f, ba = 0.0f, sb = 0.0f, bb = 0.0f;
+            _Pragma("clang loop unroll(full)")
+            for (int d = 0; d < DT; d++) {
+                if (BITS != 16 && d % DG == 0) {
+                    const int g = d / DG;
+                    sa = float(ksc[size_t(ka) * NG + g]);
+                    ba = float(kbi[size_t(ka) * NG + g]);
+                    sb = float(ksc[size_t(kb2) * NG + g]);
+                    bb = float(kbi[size_t(kb2) * NG + g]);
+                }
+                // K^T: element (dim fm, key fn) is K[fn][fm].
+                const int col = d * 8 + fm;
+                simdgroup_matrix<float, 8, 8> kt;
+                if (BITS == 16) {
+                    kt.thread_elements()[0] = float(((const device T*)ra)[col]);
+                    kt.thread_elements()[1] = float(((const device T*)rb)[col]);
+                } else {
+                    const int sh = (col % (32 / BITS)) * BITS;
+                    const uint wa = ((const device uint*)ra)[col * BITS / 32];
+                    const uint wb = ((const device uint*)rb)[col * BITS / 32];
+                    kt.thread_elements()[0] = float(T(sa * float((wa >> sh) & MASK) + ba));
+                    kt.thread_elements()[1] = float(T(sb * float((wb >> sh) & MASK) + bb));
+                }
+                simdgroup_multiply_accumulate(sc[c8], qf[d], kt, sc[c8]);
+            }
+            _Pragma("clang loop unroll(full)")
+            for (int e = 0; e < 2; e++) {
+                const int jj = jt + c8 * 8 + fn + e;
+                float s = -INFINITY;
+                if (row_ok && jj < j1 && (CAUSAL == 0 || jj <= pos)) {
+                    s = sc[c8].thread_elements()[e] * scale;
+                    if (R > 0) {
+                        const int dist = pos - jj;
+                        if (dist >= 0 && dist < R) {
+                            s += float(rel[(size_t(lr) * HQ + hr) * R + dist]);
+                        }
+                    }
+                    s *= LOG2E;
+                }
+                sc[c8].thread_elements()[e] = s;
+                tmax = max(tmax, s);
+            }
+        }
+        tmax = max(tmax, simd_shuffle_xor(tmax, ushort(1)));
+        tmax = max(tmax, simd_shuffle_xor(tmax, ushort(8)));
+        const float nm = max(m, tmax);
+        // A row with no valid key yet keeps zeros (no NaN from -inf - -inf).
+        const float f = nm == -INFINITY ? 1.0f : fast::exp2(m - nm);
+        float psum = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (int c8 = 0; c8 < KS / 8; c8++) {
+            _Pragma("clang loop unroll(full)")
+            for (int e = 0; e < 2; e++) {
+                const float p = nm == -INFINITY ? 0.0f : fast::exp2(sc[c8].thread_elements()[e] - nm);
+                sc[c8].thread_elements()[e] = p;
+                psum += p;
+            }
+        }
+        psum += simd_shuffle_xor(psum, ushort(1));
+        psum += simd_shuffle_xor(psum, ushort(8));
+        ssum = ssum * f + psum;
+        m = nm;
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < DT; d++) {
+            o[d].thread_elements()[0] *= f;
+            o[d].thread_elements()[1] *= f;
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int c8 = 0; c8 < KS / 8; c8++) {
+            // V: element (key fm, dim fn) and (key fm, dim fn + 1).
+            const int kvr = min(jt + c8 * 8 + fm, j1 - 1);
+            const device uint8_t* vrow = vbytes + size_t(kvr) * ROW_BYTES;
+            float vsf = 0.0f, vbf = 0.0f;
+            _Pragma("clang loop unroll(full)")
+            for (int d = 0; d < DT; d++) {
+                if (BITS != 16 && d % DG == 0) {
+                    vsf = float(vsc[size_t(kvr) * NG + d / DG]);
+                    vbf = float(vbi[size_t(kvr) * NG + d / DG]);
+                }
+                const int col = d * 8 + fn;
+                simdgroup_matrix<float, 8, 8> vt;
+                if (BITS == 16) {
+                    const vec<T, 2> v2 = *(const device vec<T, 2>*)((const device T*)vrow + col);
+                    vt.thread_elements()[0] = float(v2.x);
+                    vt.thread_elements()[1] = float(v2.y);
+                } else {
+                    const int sh = (col % (32 / BITS)) * BITS;
+                    const uint w = ((const device uint*)vrow)[col * BITS / 32];
+                    vt.thread_elements()[0] = float(T(vsf * float((w >> sh) & MASK) + vbf));
+                    vt.thread_elements()[1] = float(T(vsf * float((w >> (sh + BITS)) & MASK) + vbf));
+                }
+                simdgroup_multiply_accumulate(o[d], sc[c8], vt, o[d]);
+            }
+        }
+    }
+
+    const size_t base = (size_t(kvh) * NB + part) * GL + qr;
+    if (row_ok) {
+        if ((lane & 9) == 0) {
+            pm[base] = m;
+            ps[base] = ssum;
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < DT; d++) {
+            po[base * D + d * 8 + fn] = o[d].thread_elements()[0];
+            po[base * D + d * 8 + fn + 1] = o[d].thread_elements()[1];
+        }
+    }
+"#;
+
 /// Most key parts per KV head of the quantized decode attention (K-4). On M4
 /// Max, 512 parts of this kernel beat the 64 that suit MLX's own attention
 /// (1.38 vs 2.08 ms per pass at 160k tokens, see `bench_decode_160k`).
@@ -616,12 +805,18 @@ pub struct Kernels {
     routing: MetalKernel,
     quant_partial: MetalKernel,
     quant_reduce: MetalKernel,
+    quant_verify: MetalKernel,
     relative_quant: MetalKernel,
     /// Key parts per KV head of the quantized decode attention; 0 adapts to
     /// the context length.
     pub decode_parts: i32,
     /// Keys per simdgroup step (1, 2, 4 or 8); 0 picks by query count.
     pub decode_keys_per_step: i32,
+    /// Fewest queries that take the simdgroup-matrix kernel instead of the
+    /// per-lane one.
+    pub matrix_from: i32,
+    /// Fewest keys from which a single query takes the matrix kernel too.
+    pub matrix_decode_from: i32,
 }
 
 impl Kernels {
@@ -661,6 +856,15 @@ impl Kernels {
                 QUANT_DECODE_PARTIAL_SOURCE,
                 contiguous.clone(),
             ))?,
+            quant_verify: ops::with_mlx_message(MetalKernel::new(
+                "quant_verify_partial",
+                &[
+                    "q", "kw", "ks", "kb", "vw", "vs", "vb", "rel", "sizes", "scale",
+                ],
+                &["pm", "ps", "po"],
+                QUANT_VERIFY_PARTIAL_SOURCE,
+                contiguous.clone(),
+            ))?,
             quant_reduce: ops::with_mlx_message(MetalKernel::new(
                 "quant_decode_reduce",
                 &["pm", "ps", "po", "sinks"],
@@ -690,6 +894,11 @@ impl Kernels {
             ))?,
             decode_parts: 0,
             decode_keys_per_step: 0,
+            matrix_from: 2,
+            // On M4 Max, 8-bit at 516k tokens: 2.9 ms per pass against 3.6
+            // per lane; about even at 160k, slightly slower on short
+            // contexts (see bench_speculative_attention).
+            matrix_decode_from: 256 * 1024,
         })
     }
 
@@ -888,6 +1097,62 @@ impl Kernels {
         scale: f32,
         format: crate::cache::KvFormat,
     ) -> Result<Array> {
+        self.split_key_attention(q, keys, values, len, rel, sinks, scale, format, true)
+    }
+
+    /// Attention of L <= 8 queries that all see the first `len` keys of a
+    /// bf16 cache (full buffers (1, Hkv, capacity, D)): no mask, bias or
+    /// sink. The drafter's block. Returns (1, L, Hq, D).
+    pub fn block_attention(
+        &self,
+        q: &Array,
+        keys: &Array,
+        values: &Array,
+        len: i32,
+        scale: f32,
+    ) -> Result<Array> {
+        let [_, hq, l, _] = q.shape()[..] else {
+            unreachable!()
+        };
+        // Scales and biases are not read for 16 bits; the buffer itself
+        // stands in (small arrays would be passed as constants).
+        let wrap = |a: &Array| crate::cache::Packed {
+            w: a.clone(),
+            scales: a.clone(),
+            biases: a.clone(),
+        };
+        // R = 0: the bias is never read. A -inf sink adds nothing.
+        let rel = ops::zeros(&[1, l, hq, 1], q.dtype())?;
+        let sinks = ops::broadcast_to(
+            &ops::scalar(f32::NEG_INFINITY, Dtype::Float32)?,
+            &[1, l, hq],
+        )?;
+        self.split_key_attention(
+            q,
+            &wrap(keys),
+            &wrap(values),
+            len,
+            &rel,
+            &sinks,
+            scale,
+            crate::cache::KvFormat::BF16,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_key_attention(
+        &self,
+        q: &Array,
+        keys: &crate::cache::Packed,
+        values: &crate::cache::Packed,
+        len: i32,
+        rel: &Array,
+        sinks: &Array,
+        scale: f32,
+        format: crate::cache::KvFormat,
+        causal: bool,
+    ) -> Result<Array> {
         let [b, hq, l, d] = q.shape()[..] else {
             unreachable!()
         };
@@ -903,6 +1168,10 @@ impl Kernels {
         let [_, hkv, cap, _] = keys.w.shape()[..] else {
             unreachable!()
         };
+        anyhow::ensure!(
+            0 < len && len <= cap && (!causal || l <= len),
+            "attention over {len} keys (capacity {cap}) with {l} queries"
+        );
         let g = hq / hkv;
         let gl = g * l;
         let parts = match self.decode_parts {
@@ -926,18 +1195,31 @@ impl Kernels {
                     k => k,
                 },
             ),
-            int("R", rel.shape()[3]),
+            int("R", if causal { rel.shape()[3] } else { 0 }),
+            int("CAUSAL", causal as i32),
+            // Keys per step of the matrix kernel: 8, 16 and 32 were within
+            // 5% of each other at 516k tokens.
+            int("KS", 16),
         ];
+        // Only the matrix kernel has the bidirectional mode.
+        let matrix = !causal || l >= self.matrix_from || len >= self.matrix_decode_from;
         let q = ops::contiguous(q)?;
         let rel = ops::contiguous(rel)?;
         let sinks = ops::contiguous(&ops::f32(sinks)?)?;
         let sizes = Array::from_slice(&[len, cap], &[2]);
         let scale = f32s(scale);
         let n = hkv * parts * gl;
-        // SAFETY: one simdgroup per (part, KV head); all indexing stays
-        // within the shapes checked above, as the kernel comments describe.
+        // SAFETY: per lane, one simdgroup per (part, KV head); with
+        // matrices, one simdgroup per 8 query rows of that pair. All
+        // indexing stays within the shapes checked above, as the kernel
+        // comments describe.
+        let (kernel, threads) = if matrix {
+            (&self.quant_verify, (g * l + 7) / 8 * 32)
+        } else {
+            (&self.quant_partial, 32)
+        };
         let partial = unsafe {
-            ops::with_mlx_message(self.quant_partial.apply(
+            ops::with_mlx_message(kernel.apply(
                 &[
                     &q,
                     &keys.w,
@@ -964,8 +1246,8 @@ impl Kernels {
                         dtype: Dtype::Float32,
                     },
                 ],
-                (parts * 32, hkv, 1),
-                (32, 1, 1),
+                (parts * threads, hkv, 1),
+                (threads, 1, 1),
                 MetalKernelApplyOptions {
                     template_args: template_args.clone(),
                     ..Default::default()

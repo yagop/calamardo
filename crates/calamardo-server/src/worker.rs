@@ -450,23 +450,17 @@ pub fn spawn(
                 aligned: config.aligned_prefix,
             };
             cache.prewarm();
-            // One policy for the server: it learns block sizes across requests.
-            let mut policy = drafter
+            // The best block depends on the context length and the text, so
+            // each request learns its own (as mlx-vlm does per generation).
+            let draft_ceiling = drafter
                 .as_ref()
-                .map(|d| DraftPolicy::new(config.draft_block.min(d.block_size)));
+                .map(|d| config.draft_block.min(d.block_size));
             while let Some(job) = queue.pop() {
                 metrics.set_queue(queue.len());
                 queue.set_current(Some(job.cancel.clone()));
                 let (mut session, cached) = cache.take(&job.prompt);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(
-                        &mut session,
-                        cached,
-                        &config,
-                        &job,
-                        &metrics,
-                        policy.as_mut(),
-                    )
+                    run(&mut session, cached, &config, &job, &metrics, draft_ceiling)
                 }));
                 queue.set_current(None);
                 match result {
@@ -515,7 +509,7 @@ fn run(
     config: &WorkerConfig,
     job: &Job,
     metrics: &Metrics,
-    mut policy: Option<&mut DraftPolicy>,
+    draft_ceiling: Option<usize>,
 ) -> Result<()> {
     let send = |e: Event| {
         if job.events.send(e).is_err() {
@@ -536,9 +530,9 @@ fn run(
     metrics.prefill_done(job.prompt.len() - cached, t.elapsed().as_secs_f64());
 
     let mut sampler = Sampler::new(job.temperature, job.top_p, job.seed);
-    if !session.has_drafter() {
-        policy = None;
-    }
+    let mut policy = draft_ceiling
+        .filter(|_| session.has_drafter())
+        .map(DraftPolicy::new);
     let mut cleared = 0;
     let t = Instant::now();
     let stop = &config.stop_tokens;

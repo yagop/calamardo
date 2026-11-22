@@ -37,20 +37,24 @@ impl KvCache {
             let n_steps = (STEP + l - 1) / STEP;
             let new_k = ops::zeros(&[b, h, n_steps * STEP, dk], keys.dtype())?;
             let new_v = ops::zeros(&[b, h, n_steps * STEP, dv], values.dtype())?;
-            match (self.keys.take(), self.values.take()) {
-                (Some(mut k), Some(mut v)) => {
-                    if prev % STEP != 0 {
-                        k = ops::slice(&k, 2, 0, prev, 1)?;
-                        v = ops::slice(&v, 2, 0, prev, 1)?;
-                    }
-                    self.keys = Some(ops::concatenate(&[&k, &new_k], 2)?);
-                    self.values = Some(ops::concatenate(&[&v, &new_v], 2)?);
+            // Built from borrowed handles and assigned only on success, so
+            // an error leaves the cache as it was.
+            let (k, v) = match (&self.keys, &self.values) {
+                (Some(k), Some(v)) => {
+                    let (k, v) = if prev % STEP != 0 {
+                        (ops::slice(k, 2, 0, prev, 1)?, ops::slice(v, 2, 0, prev, 1)?)
+                    } else {
+                        (k.clone(), v.clone())
+                    };
+                    (
+                        ops::concatenate(&[&k, &new_k], 2)?,
+                        ops::concatenate(&[&v, &new_v], 2)?,
+                    )
                 }
-                _ => {
-                    self.keys = Some(new_k);
-                    self.values = Some(new_v);
-                }
-            }
+                _ => (new_k, new_v),
+            };
+            self.keys = Some(k);
+            self.values = Some(v);
         }
         self.offset += l;
         let k = self.keys.as_ref().unwrap();

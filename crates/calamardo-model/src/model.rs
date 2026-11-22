@@ -1103,6 +1103,10 @@ impl Model {
         &self.lm_head
     }
 
+    pub fn kernels(&self) -> &Kernels {
+        &self.kernels
+    }
+
     fn text(&self) -> &TextConfig {
         &self.config.text_config
     }

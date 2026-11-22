@@ -43,7 +43,7 @@ fn bench_speculative_round() {
         let t = Instant::now();
         for _ in 0..reps {
             let _ = drafter
-                .draft(&model, s.draft_state().unwrap(), last, 7)
+                .draft(&model, s.draft_state_mut().unwrap(), last, 7)
                 .unwrap();
         }
         let draft = t.elapsed().as_secs_f64() / reps as f64;

@@ -16,6 +16,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::{
     cache::{KvCache, RotatingKvCache},
+    kernels::{Kernels, MAX_DECODE_QUERIES},
     model::Model,
     ops::{self, f32s},
 };
@@ -305,14 +306,56 @@ impl Drafter {
 
     fn attention(
         &self,
+        kern: &Kernels,
         layer: &Layer,
         x: &Array,
-        cache: &DraftCache,
+        cache: &mut DraftCache,
         offset: i32,
     ) -> Result<Array> {
         let [b, l, _] = x.shape()[..] else {
             unreachable!()
         };
+        let q = ops::rms_norm(
+            &heads(&ops::linear(x, &layer.q_proj)?, self.heads, self.head_dim)?,
+            Some(&layer.q_norm),
+            self.eps,
+        )?;
+        let q = ops::rope(&q, self.head_dim, self.rope_theta, offset)?;
+        let bk = ops::rms_norm(
+            &heads(
+                &ops::linear(x, &layer.k_proj)?,
+                self.kv_heads,
+                self.head_dim,
+            )?,
+            Some(&layer.k_norm),
+            self.eps,
+        )?;
+        let bk = ops::rope(&bk, self.head_dim, self.rope_theta, offset)?;
+        let bv = heads(
+            &ops::linear(x, &layer.v_proj)?,
+            self.kv_heads,
+            self.head_dim,
+        )?;
+        let scale = (self.head_dim as f32).powf(-0.5);
+        if let DraftCache::Global(c) = cache
+            && b == 1
+            && l <= MAX_DECODE_QUERIES
+        {
+            // The whole context: the block's keys go into the cache buffer
+            // after the context (in place, no copy of the history) for the
+            // split-key kernel, and are forgotten again. MLX's attention
+            // over a long context would be slower and need a concatenated
+            // copy.
+            let len = c.offset;
+            let out = (|| {
+                drop(c.update_and_fetch(&bk, &bv)?);
+                let (kb, vb) = c.buffers().context("empty drafter cache")?;
+                kern.block_attention(&q, kb, vb, c.offset, scale)
+            })();
+            // The context is left as it was, even on error.
+            c.truncate(len);
+            return ops::linear(&ops::reshape(&out?, &[b, l, -1])?, &layer.o_proj);
+        }
         let (ck, cv) = match cache {
             DraftCache::Global(c) => c.keys_and_values()?,
             DraftCache::Window(c) => {
@@ -329,50 +372,21 @@ impl Drafter {
                 }
             }
         };
-        let q = ops::rms_norm(
-            &heads(&ops::linear(x, &layer.q_proj)?, self.heads, self.head_dim)?,
-            Some(&layer.q_norm),
-            self.eps,
-        )?;
-        let bk = ops::rms_norm(
-            &heads(
-                &ops::linear(x, &layer.k_proj)?,
-                self.kv_heads,
-                self.head_dim,
-            )?,
-            Some(&layer.k_norm),
-            self.eps,
-        )?;
-        let k = ops::concatenate(
-            &[
-                &ck,
-                &ops::rope(&bk, self.head_dim, self.rope_theta, offset)?,
-            ],
-            2,
-        )?;
-        let v = ops::concatenate(
-            &[
-                &cv,
-                &heads(
-                    &ops::linear(x, &layer.v_proj)?,
-                    self.kv_heads,
-                    self.head_dim,
-                )?,
-            ],
-            2,
-        )?;
-        let q = ops::rope(&q, self.head_dim, self.rope_theta, offset)?;
-        let out = ops::sdpa_nomask(&q, &k, &v, (self.head_dim as f32).powf(-0.5))?;
+        let k = ops::concatenate(&[&ck, &bk], 2)?;
+        let v = ops::concatenate(&[&cv, &bv], 2)?;
+        let out = ops::sdpa_nomask(&q, &k, &v, scale)?;
         let out = ops::reshape(&ops::transpose(&out, &[0, 2, 1, 3])?, &[b, l, -1])?;
         ops::linear(&out, &layer.o_proj)
     }
 
     /// Proposes `count` tokens after `anchor` (the last accepted token, not
-    /// yet in the context), greedily.
+    /// yet in the context), greedily. `state` is borrowed mutably only as
+    /// scratch room (the block's keys sit after the context in the global
+    /// layer's buffer during the call); its context is unchanged on return.
     pub fn draft(
         &self,
         target: &Model,
-        state: &DraftState,
+        state: &mut DraftState,
         anchor: u32,
         count: usize,
     ) -> Result<Vec<u32>> {
@@ -396,7 +410,8 @@ impl Drafter {
         // Bidirectional attention needs the full trained block.
         let mut x = ops::concatenate(&[&embed, &masks], 1)?;
         let mut residual: Option<Array> = None;
-        for (layer, cache) in self.layers.iter().zip(&state.caches) {
+        let len = state.len;
+        for (layer, cache) in self.layers.iter().zip(state.caches.iter_mut()) {
             let summed = match &residual {
                 None => x.clone(),
                 Some(r) => ops::add(&ops::f32(&x)?, &ops::f32(r)?)?,
@@ -406,7 +421,7 @@ impl Drafter {
                 &ops::rms_norm(&summed, Some(&layer.input_layernorm), self.eps)?,
                 dtype,
             )?;
-            let h = self.attention(layer, &normed, cache, state.len)?;
+            let h = self.attention(target.kernels(), layer, &normed, cache, len)?;
             let summed = ops::add(&ops::f32(&h)?, &ops::f32(&res)?)?;
             let normed = ops::astype(
                 &ops::rms_norm(&summed, Some(&layer.post_attention_layernorm), self.eps)?,

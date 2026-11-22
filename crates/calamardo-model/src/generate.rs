@@ -170,6 +170,11 @@ impl std::error::Error for Cancelled {}
 /// Periodic snapshots during a prefill (C-1).
 pub const SNAPSHOT_EVERY: usize = 8192;
 
+/// Periodic snapshots kept per session (the most recent ones). Each holds
+/// the 40 sliding windows as they are after a prefill chunk (up to ~0.5 GB),
+/// so a 512k prompt would otherwise keep ~32 GB of them.
+pub const MAX_PERIODIC_SNAPSHOTS: usize = 8;
+
 /// A point of a session's sequence it can return to.
 #[derive(Clone)]
 pub struct Snapshot {
@@ -292,6 +297,10 @@ impl<'m> Session<'m> {
         self.draft.as_ref()
     }
 
+    pub fn draft_state_mut(&mut self) -> Option<&mut DraftState> {
+        self.draft.as_mut()
+    }
+
     fn take_snapshot(&mut self, prompt_end: bool) {
         if let Some(last) = self.snapshots.last_mut()
             && last.len == self.tokens.len()
@@ -306,6 +315,11 @@ impl<'m> Session<'m> {
             passes: self.cache.iter().map(|c| c.snapshot()).collect(),
             draft: self.draft.as_ref().map(|d| d.snapshot()),
         });
+        if self.snapshots.iter().filter(|s| !s.prompt_end).count() > MAX_PERIODIC_SNAPSHOTS
+            && let Some(i) = self.snapshots.iter().position(|s| !s.prompt_end)
+        {
+            self.snapshots.remove(i);
+        }
     }
 
     /// The longest start for `prompt`: the live end if the prompt extends
@@ -509,7 +523,7 @@ impl<'m> Session<'m> {
         stop: &[u32],
     ) -> Result<Speculated> {
         let drafter = self.drafter.context("speculation needs a drafter")?;
-        let state = self.draft.as_ref().context("speculation needs a drafter")?;
+        let state = self.draft.as_mut().context("speculation needs a drafter")?;
         let drafts = drafter.draft(self.model, state, last, block.saturating_sub(1).max(1))?;
         let mut input: Vec<i32> = vec![last as i32];
         input.extend(drafts.iter().map(|&t| t as i32));
@@ -562,18 +576,19 @@ pub struct DraftPolicy {
 
 impl DraftPolicy {
     const WINDOW: usize = 8;
-    const PROBE_EVERY: usize = 12;
+    const PROBE_EVERY: usize = 24;
     const MARGIN: f64 = 1.05;
 
-    /// `ceiling`: the largest block (the drafter's trained block at most).
+    /// `ceiling`: a cap on the block (the drafter's trained block at most);
+    /// the sizes tried are 1, 2, 4 and 6 not above it.
     pub fn new(ceiling: usize) -> Self {
-        let mut sizes: Vec<usize> = [1, 2, 4, 6, 8]
+        // Blocks of 8 never won on M4 Max (verifying 8 tokens costs more
+        // than the extra drafts gain, see bench_speculative_round), and each
+        // size explored costs a few rounds.
+        let sizes: Vec<usize> = [1, 2, 4, 6]
             .into_iter()
             .filter(|&b| b <= ceiling.max(1))
             .collect();
-        if !sizes.contains(&ceiling) && ceiling > 1 {
-            sizes.push(ceiling);
-        }
         let n = sizes.len();
         Self {
             sizes,

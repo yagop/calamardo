@@ -80,7 +80,8 @@ enum Cmd {
         /// Decode without the DSpark drafter.
         #[arg(long)]
         no_draft: bool,
-        /// Largest draft block (anchor plus drafts), 2 to 8.
+        /// Cap on the draft block (anchor plus drafts), 2 to 8: the policy
+        /// picks among blocks of 2, 4 and 6 not above it.
         #[arg(long, default_value_t = 8)]
         draft_block: usize,
     },

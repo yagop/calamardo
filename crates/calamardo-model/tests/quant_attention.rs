@@ -62,8 +62,10 @@ fn cache_with(format: KvFormat, s: i32, seed: u32) -> QuantKvCache {
 
 #[test]
 fn dequantization_matches_mlx_bit_for_bit() {
-    let kern = Kernels::new().unwrap();
-    for bits in [4, 8] {
+    let mut kern = Kernels::new().unwrap();
+    // Per lane, then with matrices.
+    for (matrix_from, bits) in [(2, 4), (2, 8), (1, 4), (1, 8)] {
+        kern.matrix_from = matrix_from;
         for group in [32, 64, 128] {
             let format = KvFormat::new(bits, group).unwrap();
             let c = cache_with(format, 1, 7 + bits as u32 + group as u32);
@@ -93,7 +95,7 @@ fn dequantization_matches_mlx_bit_for_bit() {
                     assert_eq!(
                         a.to_bits(),
                         b.to_bits(),
-                        "bits {bits} group {group} head {h} dim {d}: {a} vs {b}"
+                        "matrix from {matrix_from}, bits {bits} group {group} head {h} dim {d}: {a} vs {b}"
                     );
                 }
             }
@@ -156,13 +158,23 @@ fn reference(
 
 #[test]
 fn attention_matches_dequantized_reference() {
-    let kern = Kernels::new().unwrap();
+    let mut kern = Kernels::new().unwrap();
     let scale = (D as f64).powf(-0.5);
     let mut worst = 0.0f64;
-    for (bits, group) in [(8, 64), (4, 64), (8, 32), (4, 128)] {
+    // Both kernels: per lane for one query and matrices for several, then
+    // matrices for all.
+    for (matrix_from, bits, group) in [
+        (2, 8, 64),
+        (2, 4, 64),
+        (2, 8, 32),
+        (2, 4, 128),
+        (1, 8, 64),
+        (1, 4, 32),
+    ] {
+        kern.matrix_from = matrix_from;
         let format = KvFormat::new(bits, group).unwrap();
         for s in [1, 37, 300, 2500] {
-            for l in [1, 3, 8] {
+            for l in [1, 2, 3, 5, 8] {
                 if l > s {
                     continue;
                 }
@@ -203,13 +215,118 @@ fn attention_matches_dequantized_reference() {
                     worst = worst.max(err / tol);
                     assert!(
                         err <= tol,
-                        "bits {bits} group {group} S {s} L {l} [{i}]: {a} vs {b}"
+                        "matrix from {matrix_from}, bits {bits} group {group} S {s} L {l} [{i}]: {a} vs {b}"
                     );
                 }
             }
         }
     }
     eprintln!("worst error / tolerance: {worst:.3}");
+}
+
+/// Key parts whose keys are all masked for some queries (a last part
+/// shorter than L) or empty (more parts than keys), with both kernels.
+#[test]
+fn masked_and_empty_parts_match_reference() {
+    let mut kern = Kernels::new().unwrap();
+    let scale = (D as f64).powf(-0.5);
+    let format = KvFormat::new(8, 64).unwrap();
+    let s = 37;
+    let c = cache_with(format, s, 99);
+    let (k, v) = c.dequantized().unwrap();
+    for (matrix_from, parts) in [(2, 6), (2, 20), (2, 50), (1, 6), (1, 50)] {
+        kern.matrix_from = matrix_from;
+        kern.decode_parts = parts;
+        for l in [1, 3, 8] {
+            let q = bf16(
+                data((HQ * l * D) as usize, 51 + l as u32, 0.2),
+                &[1, HQ, l, D],
+            );
+            let rel = bf16(data((l * HQ * R) as usize, 53, 1.0), &[1, l, HQ, R]);
+            let sinks = bf16(data((l * HQ) as usize, 57, 2.0), &[1, l, HQ]);
+            let out = kern
+                .quantized_decode_attention(
+                    &q,
+                    c.keys.as_ref().unwrap(),
+                    c.values.as_ref().unwrap(),
+                    s,
+                    &rel,
+                    &sinks,
+                    scale as f32,
+                    format,
+                )
+                .unwrap();
+            let got = host(&out);
+            let want = reference(
+                &host(&q),
+                &host(&k),
+                &host(&v),
+                &host(&rel),
+                &host(&sinks),
+                s,
+                l,
+                scale,
+            );
+            for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                let tol = b.abs() * 2.0f64.powi(-7) + 1e-3;
+                assert!(
+                    (a as f64 - b).abs() <= tol,
+                    "matrix from {matrix_from}, {parts} parts, L {l} [{i}]: {a} vs {b}"
+                );
+            }
+        }
+    }
+}
+
+/// The drafter's block: every query sees every key, no bias or sink.
+#[test]
+fn block_attention_matches_reference() {
+    let kern = Kernels::new().unwrap();
+    let scale = (D as f64).powf(-0.5);
+    let g = (HQ / HKV) as usize;
+    for s in [8, 300, 2500] {
+        let l = 8;
+        let cap = s + 21;
+        let kv = bf16(
+            data((HKV * cap * D) as usize, 41 + s as u32, 2.0),
+            &[1, HKV, cap, D],
+        );
+        let vv = bf16(
+            data((HKV * cap * D) as usize, 42 + s as u32, 1.0),
+            &[1, HKV, cap, D],
+        );
+        let q = bf16(data((HQ * l * D) as usize, 43, 0.2), &[1, HQ, l, D]);
+        let got = host(&kern.block_attention(&q, &kv, &vv, s, scale as f32).unwrap());
+        let (qh, kh, vh) = (host(&q), host(&kv), host(&vv));
+        let (su, cu, d) = (s as usize, cap as usize, D as usize);
+        for h in 0..HQ as usize {
+            let kvh = h / g;
+            for qi in 0..l as usize {
+                let logits: Vec<f64> = (0..su)
+                    .map(|j| {
+                        (0..d)
+                            .map(|c| {
+                                qh[(h * 8 + qi) * d + c] as f64 * kh[(kvh * cu + j) * d + c] as f64
+                            })
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let w: Vec<f64> = logits.iter().map(|x| (x - m).exp()).collect();
+                let z: f64 = w.iter().sum();
+                for c in 0..d {
+                    let b = (0..su)
+                        .map(|j| w[j] * vh[(kvh * cu + j) * d + c] as f64)
+                        .sum::<f64>()
+                        / z;
+                    let a = got[(qi * HQ as usize + h) * d + c] as f64;
+                    let tol = b.abs() * 2.0f64.powi(-7) + 1e-3;
+                    assert!((a - b).abs() <= tol, "S {s} h {h} q {qi} c {c}: {a} vs {b}");
+                }
+            }
+        }
+    }
 }
 
 /// Decode attention at 160k tokens for one global pass: quantized kernel vs
@@ -219,7 +336,7 @@ fn attention_matches_dequantized_reference() {
 fn bench_decode_160k() {
     use std::time::Instant;
     let mut kern = Kernels::new().unwrap();
-    let s = 160 * 1024;
+    let s = std::env::var("BENCH_LEN").map_or(160 * 1024, |v| v.parse().unwrap());
     let q = bf16(data((HQ * D) as usize, 3, 0.2), &[1, HQ, 1, D]);
     let rel = bf16(data((HQ * 1024) as usize, 5, 1.0), &[1, 1, HQ, 1024]);
     let sinks = bf16(data(HQ as usize, 7, 1.0), &[1, 1, HQ]);
@@ -388,5 +505,97 @@ fn packed_prefill_equals_dequantized_bit_for_bit() {
                 assert!(same, "bits {bits} group {group} S {s} L {l}");
             }
         }
+    }
+}
+
+/// Costs of the speculative pieces at long context: the drafter's global
+/// layer (8 bidirectional queries over a bf16 cache) and verification
+/// (L queries over the quantized cache). `BENCH_LEN` sets the keys.
+#[test]
+#[ignore]
+fn bench_speculative_attention() {
+    use calamardo_model::cache::Packed;
+    use std::time::Instant;
+    let mut kern = Kernels::new().unwrap();
+    kern.matrix_from = std::env::var("MATRIX_FROM").map_or(2, |v| v.parse().unwrap());
+    kern.decode_parts = std::env::var("PARTS").map_or(0, |v| v.parse().unwrap());
+    let s = std::env::var("BENCH_LEN").map_or(160 * 1024, |v| v.parse().unwrap());
+    let iters = 20;
+    let time = |name: &str, f: &dyn Fn() -> Array| {
+        ops::eval(&[&f()]).unwrap();
+        let t = Instant::now();
+        for _ in 0..iters {
+            ops::eval(&[&f()]).unwrap();
+        }
+        eprintln!(
+            "{name:<40} {:.2} ms",
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        );
+    };
+    let cap = s + 256;
+    let kb = bf16(data((HKV * cap * D) as usize, 9, 2.0), &[1, HKV, cap, D]);
+    let vb = bf16(data((HKV * cap * D) as usize, 10, 1.0), &[1, HKV, cap, D]);
+    let q8 = bf16(data((HQ * 8 * D) as usize, 3, 0.2), &[1, HQ, 8, D]);
+    let nk = bf16(data((HKV * 8 * D) as usize, 4, 2.0), &[1, HKV, 8, D]);
+    let ks = ops::slice(&kb, 2, 0, s, 1).unwrap();
+    let vs = ops::slice(&vb, 2, 0, s, 1).unwrap();
+    time("draft: concat ctx + block", &|| {
+        // The slices keep MLX from skipping the (full) concatenations.
+        let a = ops::concatenate(&[&ks, &nk], 2).unwrap();
+        let b = ops::concatenate(&[&vs, &nk], 2).unwrap();
+        ops::add(
+            &ops::slice(&a, 2, s, s + 8, 1).unwrap(),
+            &ops::slice(&b, 2, s, s + 8, 1).unwrap(),
+        )
+        .unwrap()
+    });
+    let kc = ops::slice(&kb, 2, 0, s + 8, 1).unwrap();
+    let vc = ops::slice(&vb, 2, 0, s + 8, 1).unwrap();
+    time("draft: sdpa 8 queries (strided view)", &|| {
+        ops::sdpa_nomask(&q8, &kc, &vc, 0.088).unwrap()
+    });
+    let wrap = |a: &Array| Packed {
+        w: a.clone(),
+        scales: a.clone(),
+        biases: a.clone(),
+    };
+    for l in [1, 2, 4, 8] {
+        let q = bf16(data((HQ * l * D) as usize, 3, 0.2), &[1, HQ, l, D]);
+        let rel = bf16(data((l * HQ * R) as usize, 5, 1.0), &[1, l, HQ, R]);
+        let sinks = bf16(data((l * HQ) as usize, 7, 1.0), &[1, l, HQ]);
+        time(&format!("bf16 split-key kernel, {l} queries"), &|| {
+            kern.quantized_decode_attention(
+                &q,
+                &wrap(&kb),
+                &wrap(&vb),
+                s,
+                &rel,
+                &sinks,
+                0.088,
+                KvFormat::BF16,
+            )
+            .unwrap()
+        });
+    }
+    drop((kb, vb, ks, vs, kc, vc));
+    let format = KvFormat::new(8, 64).unwrap();
+    let c = cache_with(format, s, 1);
+    for l in [1, 2, 3, 5, 7] {
+        let q = bf16(data((HQ * l * D) as usize, 3, 0.2), &[1, HQ, l, D]);
+        let rel = bf16(data((l * HQ * R) as usize, 5, 1.0), &[1, l, HQ, R]);
+        let sinks = bf16(data((l * HQ) as usize, 7, 1.0), &[1, l, HQ]);
+        time(&format!("8-bit split-key kernel, {l} queries"), &|| {
+            kern.quantized_decode_attention(
+                &q,
+                c.keys.as_ref().unwrap(),
+                c.values.as_ref().unwrap(),
+                s,
+                &rel,
+                &sinks,
+                0.088,
+                format,
+            )
+            .unwrap()
+        });
     }
 }

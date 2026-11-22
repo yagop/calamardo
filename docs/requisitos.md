@@ -321,16 +321,67 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - Medido (greedy, caché 16 bits salvo indicación):
   - Contexto corto (código Python, 400 tokens): 45,8 tok/s con drafter frente a 34,3 sin él; aceptación 52 %.
   - 31k de contexto (500 tokens): 31,1 tok/s con drafter frente a 32,5 sin él; aceptación 41 %. El objetivo de ≥ 40 tok/s a 29k no se cumple. Con contexto largo verificar un bloque cuesta casi lo que gana: el MoE lee los expertos de hasta 8 tokens y la atención hace 8 veces el trabajo por clave. Queda pendiente un kernel de verificación con multiplicación matricial (tipo flash, repartido por claves), que encaja con K-2 del Hito 8.
-- `--no-draft` lo desactiva y `--draft-block` limita el bloque. `/metrics` añade `draft_rounds_total`, `drafted_tokens_total` y `accepted_tokens_total`.
+- `--no-draft` lo desactiva y `--draft-block` limita el bloque (la política elige entre 2, 4 y 6 sin pasar de ese límite). `/metrics` añade `draft_rounds_total`, `drafted_tokens_total` y `accepted_tokens_total`.
+- Revisión (subagente), corregido:
+  - La ruta de verificación bf16 la tomaban también los trozos de prefill de 2 a 8 tokens, lo que rompía la paridad con la referencia; ahora solo la verificación (test de paridad con un prompt de 2.055 tokens).
+  - Con `--aligned-prefix` no se especula (sus decisiones dependen de tiempos medidos y no son reproducibles).
+  - El drafter ya no forma parte del manifiesto en disco: cambiar `--no-draft` no borra las conversaciones guardadas; una sesión guardada sin estado del drafter sigue sin especular.
+  - El kernel de prefill empaquetado recibe buffers contiguos; el plegado de la cabeza Markov se hace en bloques de 4.096 filas (sin 1,85 GB temporales).
+- Coste de una ronda (`bench_speculative_round`, caché bf16):
+
+  | Contexto | Decode | Borrador (7) | Ronda bloque 2 | Ronda bloque 4 | Ronda bloque 8 |
+  |---|---|---|---|---|---|
+  | 1k | 28,9 ms | 12,4 ms | 65,9 ms → 2,0 tok | 70,9 ms → 3,4 tok | 91,4 ms → 2,9 tok |
+  | 31k | 31,7 ms | 8,3 ms | 66,3 ms → 1,8 tok | 78,6 ms → 3,1 tok | 187 ms → 3,5 tok |
+
+  El bloque de 8 nunca compensa; con texto que el drafter acierta, el de 4 da ~39 tok/s a 31k.
+- Política de bloque (versión final): elige entre 1 (sin borrador), 2, 4 y 6 por tokens por segundo medidos en ventanas de 8 rondas, descartando la primera de cada tamaño, con un margen del 5 % para cambiar y sondeos cada 24 decisiones. Se reinicia en cada petición: compartida entre peticiones arrastraba lo aprendido a otro contexto (con 31k aprendía «no especules» y luego, a contexto corto, apenas volvía a probar).
+  - Contexto corto (código): 46,4 tok/s frente a 34,3 sin drafter (aceptación 51 %).
+  - 31k (ensayo, aceptación 39 %): 31,0 frente a 32,5; con poca aceptación lo mejor es casi no especular y la exploración cuesta ~5 %.
+- Instantáneas periódicas: como mucho las 8 más recientes por sesión. Cada una retiene las 40 ventanas tal como quedan tras un trozo de prefill (hasta ~0,5 GB), así que un prompt de 512k habría acumulado unos 32 GB.
 
 **Hito 8: prefill sobre la caché cuantizada (estado)**
 
 - K-2 y K-3: con caché de 8 o 4 bits, el prefill ya no descomprime el historial de ninguna pasada global. Una variante del kernel relativo carga cada bloque de claves y valores directamente del formato empaquetado, con la misma expresión de descompresión que `mx.dequantize`, y su salida es bit a bit la del kernel bf16 sobre la caché descomprimida (test con 4 y 8 bits, grupos 32/64/128, contextos de 40 a 3.000 y bloques parciales). Así que los resultados no cambian.
 - Medido con 166.561 tokens y caché de 8 bits: pico transitorio máximo de 1,74 GB (antes 2,13); la velocidad no cambia (398 tok/s a 145k, 319 s en frío), porque la descompresión no era el cuello de botella.
 - Bias sobre la marcha (parte de K-2): no se hace, a propósito. En esta arquitectura la tabla de bias mide L × 24 × 1.024 (unos 100 MB por pasada con trozos de 2.048) y no crece con el contexto, así que el problema de Ollama no existe; calcularla dentro del kernel cambiaría el orden de las sumas y rompería la paridad exacta con la referencia.
-- Pendiente (deseable): K-6 (fusionar las operaciones pequeñas y `compile` por pasada), K-7 (MoE fusionado para un token) y un kernel de verificación especulativa con multiplicación matricial repartido por claves, que es lo que falta para que el drafter rinda a contexto largo (objetivo de ≥ 40 tok/s a 29k).
+- Pendiente (deseable): K-6 (fusionar las operaciones pequeñas y `compile` por pasada) y K-7 (MoE fusionado para un token). El kernel de verificación especulativa está hecho (siguiente apartado).
 
-**Incoherencias a resolver**
+**Contexto de 512k y kernel de verificación (22 de noviembre de 2026)**
+
+El uso previsto es con 512k de contexto, así que las pruebas largas se hacen con un prompt de aguja de 516.533 tokens y caché de 8 bits.
+
+- Servidor de punta a punta (8 bits, drafter activo):
+  - Prefill en frío: 2.108 s (247 tok/s de media). Pico de 38,2 GB, transitorio máximo de 2,97 GB y 35,5 GB activos al terminar. Encuentra la aguja.
+  - Guardado en disco: 4,1 s (11,5 GB). Al reiniciar se precarga en 2 s. El turno siguiente reutiliza 516.652 de 516.664 tokens.
+  - El primer token tras cargar una sesión de disco tarda ~1 s: MLX lee los pesos de la sesión al usarlos por primera vez.
+  - En disco solo se guarda la instantánea del final del último prompt: reenviar un turno anterior de la misma conversación vuelve a hacer el prefill completo. Es lo esperado (un chat siempre extiende la conversación), pero conviene saberlo al hacer pruebas.
+- Decode sin especular a 516k: 51 ms por token (19,6 tok/s); antes 56. La atención global es la mitad (8 pasadas de ~3 ms) y el resto, sobre todo el MoE, cuesta lo mismo que a contexto corto.
+- Lo que hacía lenta la especulación a 512k (6,7 tok/s en el servidor) era la atención con varias consultas:
+  - El kernel de decode por carriles guarda en registros las G × L filas de consulta y se desborda a partir de 2 consultas. Con 8 bits a 516k, por pasada: 3,6 ms con 1 consulta, 16,7 con 3 y 168 con 7.
+  - En el drafter, su capa global concatenaba toda su caché bf16 (copia de 2 GB, 10 ms) y usaba la atención de MLX con 8 consultas (19 ms).
+- Kernel nuevo (`QUANT_VERIFY_PARTIAL_SOURCE`): cada simdgroup lleva 8 filas de consulta sobre una parte de las claves de una cabeza KV. Lee claves y valores de la caché directamente a registros de matriz, descomprimidos como `mx.dequantize`, y multiplica con matrices 8×8 en float. El softmax en línea se hace sobre los propios registros. Sin memoria de grupo ni barreras: la versión que montaba bloques en memoria de grupo era 2–4 veces más lenta. La pasada de reducción es la del kernel de decode.
+  - Hace falta desenrollar del todo los bucles sobre la dimensión de la cabeza; un índice no constante en los arrays de matrices los manda a memoria y es 4–5 veces más lento.
+  - Tiene un modo bidireccional sin bias ni sumidero para el bloque del drafter: sus 8 claves se escriben tras el contexto en el propio buffer de la caché y se descartan al terminar. El historial no se copia salvo cuando el buffer tiene que crecer o lo comparte otra sesión (tras un fork), copias que el siguiente `add_context` haría de todos modos.
+  - Por pasada a 516k (`bench_speculative_attention`):
+
+    | Consultas | 8 bits, por carriles | 8 bits, matrices | bf16, matrices |
+    |---|---|---|---|
+    | 1 | 3,6 ms | 2,9 ms | 4,9 ms |
+    | 2 | 13,4 ms | 3,0 ms | 4,7 ms |
+    | 3 | 16,7 ms | 4,6 ms | — |
+    | 5 | 40,5 ms | 4,7 ms | — |
+    | 7–8 | 168 ms (7) | 6,6 ms (7) | 7,1 ms (8) |
+
+  - Se usa para 2 o más consultas y, con una sola, desde 256k claves (a 160k empatan; con contextos cortos el de carriles es algo más rápido). Comprobado frente a la referencia en float64: 4 y 8 bits, grupos 32/64/128, de 1 a 8 consultas, y el modo bidireccional.
+- Ronda a 516k (`bench_long` sobre la sesión guardada; texto arbitrario, así que la aceptación no es representativa): decode 51 ms, borrador 13 ms, ronda de bloque 2 en 75 ms → 1,8 tokens (42 ms por token), bloque 4 en 97 ms → 2,0 y bloque 6 en 121 ms → 1,3. Antes: 189, 284 y 632 ms.
+- Servidor a 516k con los kernels nuevos (conversación guardada en disco; ensayo de 400 tokens sobre la aguja):
+  - Con drafter: 20,8 tok/s, aceptación del 46 % (174 de 380).
+  - Sin drafter: 17,4 tok/s, incluido el ~1 s del primer token tras cargar de disco.
+  - No es exactamente la misma comparación: en greedy, los dos caminos se separaron en el primer token por un casi empate (uno empezó el ensayo directamente y el otro razonando antes), así que generaron textos distintos.
+  - Prefill en frío: 239 tok/s.
+  - Una sesión guardada por un servidor con `--no-draft` no trae estado del drafter y, al cargarla con drafter, no especula hasta la siguiente conversación.
+- Desglose de una ronda de bloque 2 a 1k: borrador 4 ms, construir el grafo 3 ms, pasada de verificación 37 ms (frente a 26 de un decode) y rebobinado 1 ms. Casi todo lo que cuesta de más la verificación es el MoE: dos tokens leen hasta el doble de expertos.
 
 **Incoherencias a resolver**
 
