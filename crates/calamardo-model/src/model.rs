@@ -442,18 +442,18 @@ impl Attention {
                         c.format,
                     )?
                 } else {
-                    // Prefill reads the history dequantized (K-2 will read it packed).
-                    let (k, v) = c.dequantized()?;
-                    let key_start = ops::broadcast_to(&ops::i32s(0), &[b])?;
-                    kern.relative_attention(
+                    // Prefill reads the packed history in place (K-2, K-3):
+                    // no dequantized copy, same output bit for bit.
+                    let (keys, values) = (c.keys.as_ref().unwrap(), c.values.as_ref().unwrap());
+                    kern.relative_attention_quantized(
                         &q,
-                        &k,
-                        &v,
+                        keys,
+                        values,
+                        c.offset,
                         &position_bias,
                         &sinks,
                         self.scaling,
-                        self.window,
-                        &key_start,
+                        c.format,
                     )?
                 }
             }

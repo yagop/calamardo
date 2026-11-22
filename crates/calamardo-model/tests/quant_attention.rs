@@ -348,3 +348,45 @@ fn bf16_attention_matches_reference() {
         }
     }
 }
+
+/// K-2: the prefill kernel reading the packed cache equals, bit for bit,
+/// the bf16 kernel over the cache dequantized by `mx.dequantize`.
+#[test]
+fn packed_prefill_equals_dequantized_bit_for_bit() {
+    let kern = Kernels::new().unwrap();
+    let scale = (D as f32).powf(-0.5);
+    for (bits, group) in [(8, 64), (4, 64), (8, 32), (4, 128)] {
+        let format = KvFormat::new(bits, group).unwrap();
+        for s in [40, 600, 3000] {
+            for l in [9, 33, 100] {
+                let c = cache_with(format, s, (s + l + bits) as u32);
+                let q = bf16(
+                    data((HQ * l * D) as usize, 41 + l as u32, 0.2),
+                    &[1, HQ, l, D],
+                );
+                let rel = bf16(data((l * HQ * R) as usize, 43, 1.0), &[1, l, HQ, R]);
+                let sinks = bf16(data((l * HQ) as usize, 47, 2.0), &[1, l, HQ]);
+                let packed = kern
+                    .relative_attention_quantized(
+                        &q,
+                        c.keys.as_ref().unwrap(),
+                        c.values.as_ref().unwrap(),
+                        s,
+                        &rel,
+                        &sinks,
+                        scale,
+                        format,
+                    )
+                    .unwrap();
+                let (k, v) = c.dequantized().unwrap();
+                let start = ops::broadcast_to(&ops::i32s(0), &[1]).unwrap();
+                let want = kern
+                    .relative_attention(&q, &k, &v, &rel, &sinks, scale, 0, &start)
+                    .unwrap();
+                let (a, b) = (host(&packed), host(&want));
+                let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(same, "bits {bits} group {group} S {s} L {l}");
+            }
+        }
+    }
+}

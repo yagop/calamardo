@@ -323,6 +323,13 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
   - 31k de contexto (500 tokens): 31,1 tok/s con drafter frente a 32,5 sin él; aceptación 41 %. El objetivo de ≥ 40 tok/s a 29k no se cumple. Con contexto largo verificar un bloque cuesta casi lo que gana: el MoE lee los expertos de hasta 8 tokens y la atención hace 8 veces el trabajo por clave. Queda pendiente un kernel de verificación con multiplicación matricial (tipo flash, repartido por claves), que encaja con K-2 del Hito 8.
 - `--no-draft` lo desactiva y `--draft-block` limita el bloque. `/metrics` añade `draft_rounds_total`, `drafted_tokens_total` y `accepted_tokens_total`.
 
+**Hito 8: prefill sobre la caché cuantizada (estado)**
+
+- K-2 y K-3: con caché de 8 o 4 bits, el prefill ya no descomprime el historial de ninguna pasada global. Una variante del kernel relativo carga cada bloque de claves y valores directamente del formato empaquetado, con la misma expresión de descompresión que `mx.dequantize`, y su salida es bit a bit la del kernel bf16 sobre la caché descomprimida (test con 4 y 8 bits, grupos 32/64/128, contextos de 40 a 3.000 y bloques parciales). Así que los resultados no cambian.
+- Medido con 166.561 tokens y caché de 8 bits: pico transitorio máximo de 1,74 GB (antes 2,13); la velocidad no cambia (398 tok/s a 145k, 319 s en frío), porque la descompresión no era el cuello de botella.
+- Bias sobre la marcha (parte de K-2): no se hace, a propósito. En esta arquitectura la tabla de bias mide L × 24 × 1.024 (unos 100 MB por pasada con trozos de 2.048) y no crece con el contexto, así que el problema de Ollama no existe; calcularla dentro del kernel cambiaría el orden de las sumas y rompería la paridad exacta con la referencia.
+- Pendiente (deseable): K-6 (fusionar las operaciones pequeñas y `compile` por pasada), K-7 (MoE fusionado para un token) y un kernel de verificación especulativa con multiplicación matricial repartido por claves, que es lo que falta para que el drafter rinda a contexto largo (objetivo de ≥ 40 tok/s a 29k).
+
 **Incoherencias a resolver**
 
 **Incoherencias a resolver**

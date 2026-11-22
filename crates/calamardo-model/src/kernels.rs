@@ -502,6 +502,100 @@ const KEYS_PER_PART: i32 = 256;
 /// Most queries the quantized decode attention takes at once.
 pub const MAX_DECODE_QUERIES: i32 = 8;
 
+// K-2: the relative attention kernel reading the affine-quantized cache in
+// place, built from the same source with only the key/value tile loads
+// changed. Each value is dequantized exactly as `mx.dequantize` does (see
+// the decode kernel), then converted to half as the original converts the
+// bf16 history, so the output is bit for bit the one over the dequantized
+// cache, without materializing it.
+const RELATIVE_PTRS: &str =
+    "    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
+    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
+";
+
+const QUANT_RELATIVE_PTRS: &str = "    constexpr int ROW_BYTES = D * BITS / 8;
+    constexpr int NG = D / GROUP;
+    const size_t row0 = (size_t(batch) * HKV + kv_head) * size_t(sizes[2]);
+    const device uint8_t* kbytes = (const device uint8_t*)kw + row0 * ROW_BYTES;
+    const device uint8_t* vbytes = (const device uint8_t*)vw + row0 * ROW_BYTES;
+    const device T* ksc = ks + row0 * NG;
+    const device T* kbi = kb + row0 * NG;
+    const device T* vsc = vs + row0 * NG;
+    const device T* vbi = vb + row0 * NG;
+";
+
+const RELATIVE_LOAD: &str = "            vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            if (key < S) {
+                auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
+                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
+                kv[0] = kp[0];
+                kv[1] = kp[1];
+                vv[0] = vp[0];
+                vv[1] = vp[1];
+            }
+            for (int j = 0; j < 8; ++j) {
+                Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
+                Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
+            }
+";
+
+const QUANT_RELATIVE_LOAD: &str = "            float kf[8];
+            float vf[8];
+            if (key < S) {
+                const size_t gi = size_t(key) * NG + col / GROUP;
+                const float ksf = float(ksc[gi]);
+                const float kbf = float(kbi[gi]);
+                const float vsf = float(vsc[gi]);
+                const float vbf = float(vbi[gi]);
+                const device uint8_t* kp = kbytes + size_t(key) * ROW_BYTES + col * BITS / 8;
+                const device uint8_t* vp = vbytes + size_t(key) * ROW_BYTES + col * BITS / 8;
+                uint kwords[2];
+                uint vwords[2];
+                if (BITS == 8) {
+                    const uint2 k2 = *(const device uint2*)kp;
+                    const uint2 v2 = *(const device uint2*)vp;
+                    kwords[0] = k2.x;
+                    kwords[1] = k2.y;
+                    vwords[0] = v2.x;
+                    vwords[1] = v2.y;
+                } else {
+                    kwords[0] = *(const device uint*)kp;
+                    vwords[0] = *(const device uint*)vp;
+                    kwords[1] = 0;
+                    vwords[1] = 0;
+                }
+                constexpr int PER_WORD = 32 / BITS;
+                for (int j = 0; j < 8; ++j) {
+                    const uint8_t kq = (kwords[j / PER_WORD] >> (BITS * (j % PER_WORD))) & ((1u << BITS) - 1);
+                    const uint8_t vq = (vwords[j / PER_WORD] >> (BITS * (j % PER_WORD))) & ((1u << BITS) - 1);
+                    // As mx.dequantize: one rounding of `scale * q + bias` to bfloat.
+                    kf[j] = float(T(ksf * float(kq) + kbf));
+                    vf[j] = float(T(vsf * float(vq) + vbf));
+                }
+            } else {
+                for (int j = 0; j < 8; ++j) {
+                    kf[j] = 0.0f;
+                    vf[j] = 0.0f;
+                }
+            }
+            for (int j = 0; j < 8; ++j) {
+                Ks[(col + j) * LDK + r] = half(kf[j]);
+                Vs[r * LDV + col + j] = half(vf[j]);
+            }
+";
+
+fn quant_relative_source() -> Result<String> {
+    anyhow::ensure!(
+        RELATIVE_ATTENTION_SOURCE.contains(RELATIVE_PTRS)
+            && RELATIVE_ATTENTION_SOURCE.contains(RELATIVE_LOAD),
+        "relative attention source changed; update its quantized variant"
+    );
+    Ok(RELATIVE_ATTENTION_SOURCE
+        .replace(RELATIVE_PTRS, QUANT_RELATIVE_PTRS)
+        .replace(RELATIVE_LOAD, QUANT_RELATIVE_LOAD))
+}
+
 /// Queries per threadgroup of the relative attention kernel.
 const BQ: i32 = 32;
 /// Threads per threadgroup of the relative attention kernel.
@@ -522,6 +616,7 @@ pub struct Kernels {
     routing: MetalKernel,
     quant_partial: MetalKernel,
     quant_reduce: MetalKernel,
+    relative_quant: MetalKernel,
     /// Key parts per KV head of the quantized decode attention; 0 adapts to
     /// the context length.
     pub decode_parts: i32,
@@ -572,6 +667,26 @@ impl Kernels {
                 &["out"],
                 QUANT_DECODE_REDUCE_SOURCE,
                 contiguous,
+            ))?,
+            relative_quant: ops::with_mlx_message(MetalKernel::new(
+                "relative_attention_quantized",
+                &[
+                    "q",
+                    "kw",
+                    "ks",
+                    "kb",
+                    "vw",
+                    "vs",
+                    "vb",
+                    "rel",
+                    "sinks",
+                    "key_start",
+                    "sizes",
+                    "scale",
+                ],
+                &["out"],
+                &quant_relative_source()?,
+                MetalKernelOptions::default(),
             ))?,
             decode_parts: 0,
             decode_keys_per_step: 0,
@@ -664,6 +779,80 @@ impl Kernels {
                         int("WINDOW", window),
                         int("BQ", BQ),
                         int("TG", TG),
+                    ],
+                    ..Default::default()
+                },
+            ))?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+
+    /// `relative_attention` over the first `len` tokens of an
+    /// affine-quantized cache (full buffers (1, Hkv, capacity, ·)), reading
+    /// it packed (K-2). Same output as over the dequantized cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn relative_attention_quantized(
+        &self,
+        q: &Array,
+        keys: &crate::cache::Packed,
+        values: &crate::cache::Packed,
+        len: i32,
+        rel: &Array,
+        sinks: &Array,
+        scale: f32,
+        format: crate::cache::KvFormat,
+    ) -> Result<Array> {
+        let [b, hq, l, d] = q.shape()[..] else {
+            unreachable!()
+        };
+        let [_, hkv, cap, _] = keys.w.shape()[..] else {
+            unreachable!()
+        };
+        anyhow::ensure!(
+            matches!(format.bits, 4 | 8),
+            "packed prefill needs 4 or 8 bits"
+        );
+        let rel = ops::contiguous(rel)?;
+        let sinks = ops::contiguous(&ops::f32(sinks)?)?;
+        let key_start = ops::contiguous(&ops::broadcast_to(&ops::i32s(0), &[b])?)?;
+        let sizes = Array::from_slice(&[l, len, cap], &[3]);
+        let scale = f32s(scale);
+        // SAFETY: the launch shapes match the kernel's indexing, as in the
+        // bf16 kernel; the packed buffers hold `cap` rows per KV head.
+        let out = unsafe {
+            ops::with_mlx_message(self.relative_quant.apply(
+                &[
+                    q,
+                    &keys.w,
+                    &keys.scales,
+                    &keys.biases,
+                    &values.w,
+                    &values.scales,
+                    &values.biases,
+                    &rel,
+                    &sinks,
+                    &key_start,
+                    &sizes,
+                    &scale,
+                ],
+                &[MetalKernelOutput {
+                    shape: vec![b, l, hq, d],
+                    dtype: q.dtype(),
+                }],
+                ((l + BQ - 1) / BQ * TG, hq, b),
+                (TG, 1, 1),
+                MetalKernelApplyOptions {
+                    template_args: vec![
+                        ("T".to_string(), TemplateArg::Dtype(q.dtype())),
+                        int("D", d),
+                        int("HQ", hq),
+                        int("HKV", hkv),
+                        int("R", rel.shape()[3]),
+                        int("WINDOW", 0),
+                        int("BQ", BQ),
+                        int("TG", TG),
+                        int("BITS", format.bits),
+                        int("GROUP", format.group_size),
                     ],
                     ..Default::default()
                 },
