@@ -427,6 +427,7 @@ impl Attention {
         let k = ops::transpose(&k, &[0, 2, 1, 3])?;
         let v = ops::transpose(&v, &[0, 2, 1, 3])?;
         let verifying = cache.verifying;
+        let mut pending = None;
         let out = match &mut cache.attn {
             AttnCache::Quantized(c) => {
                 c.update(&k, &v)?;
@@ -485,11 +486,44 @@ impl Attention {
                     KvFormat::BF16,
                 )?
             }
+            // Speculative verification of a sliding window: attend over the
+            // ring buffer as it is plus the new keys, which wait in
+            // `pending` until `rewind` writes the accepted ones. The
+            // reference's path would put the window in temporal order and
+            // concatenate (several copies of it per pass).
+            AttnCache::Window(c)
+                if verifying
+                    && b == 1
+                    && (2..=MAX_DECODE_QUERIES).contains(&l)
+                    && c.ring().is_some() =>
+            {
+                let (rk, rv, rlen, ridx) = c.ring().context("empty window")?;
+                let out = kern.window_verify_attention(
+                    &q,
+                    rk,
+                    rv,
+                    rlen,
+                    ridx,
+                    &ops::contiguous(&k)?,
+                    &ops::contiguous(&v)?,
+                    &position_bias,
+                    &sinks,
+                    self.scaling,
+                    self.window,
+                )?;
+                pending = Some((k, v));
+                out
+            }
             attn => {
                 let (k, v) = attn.update_and_fetch(&k, &v)?;
                 self.attention(kern, &q, &k, &v, &position_bias, &sinks, attn)?
             }
         };
+        if verifying {
+            // This verification's keys, or none if it took the reference's
+            // path (rewind then drops the last keys instead).
+            cache.pending = pending;
+        }
 
         let out = ops::f32(&ops::reshape(&out, &[b, l, -1])?)?;
         let out = ops::mul(&out, &ops::sigmoid(&ops::f32(&gate)?)?)?;
@@ -1189,6 +1223,7 @@ impl Model {
                 conv: [None, None, None, None],
                 windows: None,
                 verifying: false,
+                pending: None,
             })
             .collect()
     }

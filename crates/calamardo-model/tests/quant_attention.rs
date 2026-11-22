@@ -655,3 +655,191 @@ fn bench_window_attention() {
         eprintln!("L {l}: relative prefill kernel {a:.1} us · split-key kernel {b:.1} us per pass");
     }
 }
+
+/// Speculative verification over a sliding window kept as a rotated ring
+/// buffer plus the new keys, against float64 attention over the tokens in
+/// temporal order. Ring states: full and rotated (decode), still filling
+/// (capacity beyond the filled slots) and longer than the window in
+/// temporal order (after a prefill chunk).
+#[test]
+fn window_verification_matches_reference() {
+    let mut kern = Kernels::new().unwrap();
+    let w = 64; // window
+    let r = 40; // relative bias width
+    let scale = (D as f64).powf(-0.5);
+    // (tokens so far, buffer capacity, filled slots, next write slot)
+    let cases = [
+        (150, w, w, 150 % w),
+        (40, w, 40, 40),
+        (90, w + 5, w + 5, w + 5),
+    ];
+    for (hist, cap, rlen, ridx) in cases {
+        let hist = hist as usize;
+        // Keys and values of every history token, (Hkv, hist, D).
+        let hk = data(HKV as usize * hist * D as usize, 61, 2.0);
+        let hv = data(HKV as usize * hist * D as usize, 62, 1.0);
+        // The ring: slot s holds the token written (ridx - 1 - s) mod rlen
+        // steps before the last one.
+        let mut rk = vec![0.0f32; (HKV * cap * D) as usize];
+        let mut rv = rk.clone();
+        for h in 0..HKV as usize {
+            for s in 0..rlen as usize {
+                let age = (ridx as usize + rlen as usize - 1 - s) % rlen as usize;
+                let t = hist - 1 - age;
+                for c in 0..D as usize {
+                    rk[(h * cap as usize + s) * D as usize + c] =
+                        hk[(h * hist + t) * D as usize + c];
+                    rv[(h * cap as usize + s) * D as usize + c] =
+                        hv[(h * hist + t) * D as usize + c];
+                }
+            }
+        }
+        let ring_k = bf16(rk, &[1, HKV, cap, D]);
+        let ring_v = bf16(rv, &[1, HKV, cap, D]);
+        // One part, then several: parts that straddle the ring and the new
+        // keys, and parts with every key masked for some queries.
+        for (l, parts) in [(1, 0), (2, 0), (5, 0), (8, 0), (2, 3), (5, 7), (8, 7)] {
+            kern.window_parts = parts;
+            let nk = bf16(
+                data((HKV * l * D) as usize, 63 + l as u32, 2.0),
+                &[1, HKV, l, D],
+            );
+            let nv = bf16(
+                data((HKV * l * D) as usize, 64 + l as u32, 1.0),
+                &[1, HKV, l, D],
+            );
+            let q = bf16(
+                data((HQ * l * D) as usize, 65 + l as u32, 0.2),
+                &[1, HQ, l, D],
+            );
+            let rel = bf16(data((l * HQ * r) as usize, 66, 1.0), &[1, l, HQ, r]);
+            let sinks = bf16(data((l * HQ) as usize, 67, 2.0), &[1, l, HQ]);
+            let got = host(
+                &kern
+                    .window_verify_attention(
+                        &q,
+                        &ring_k,
+                        &ring_v,
+                        rlen,
+                        ridx,
+                        &nk,
+                        &nv,
+                        &rel,
+                        &sinks,
+                        scale as f32,
+                        w,
+                    )
+                    .unwrap(),
+            );
+            // Reference over all tokens (bf16-rounded, as the kernel reads them).
+            let (hkb, hvb) = (
+                host(&bf16(hk.clone(), &[hk.len() as i32])),
+                host(&bf16(hv.clone(), &[hv.len() as i32])),
+            );
+            let (qh, nkh, nvh, relh, sh) =
+                (host(&q), host(&nk), host(&nv), host(&rel), host(&sinks));
+            let (lu, du, ru, g) = (l as usize, D as usize, r as usize, (HQ / HKV) as usize);
+            for h in 0..HQ as usize {
+                let kvh = h / g;
+                for qi in 0..lu {
+                    let p = hist + qi;
+                    let key = |t: usize, c: usize| {
+                        if t < hist {
+                            hkb[(kvh * hist + t) * du + c]
+                        } else {
+                            nkh[(kvh * lu + t - hist) * du + c]
+                        }
+                    };
+                    let val = |t: usize, c: usize| {
+                        if t < hist {
+                            hvb[(kvh * hist + t) * du + c]
+                        } else {
+                            nvh[(kvh * lu + t - hist) * du + c]
+                        }
+                    };
+                    let first = (p + 1)
+                        .saturating_sub(w as usize)
+                        .max(hist - rlen.min(hist as i32) as usize);
+                    let ts: Vec<usize> = (first..=p).collect();
+                    let mut logits: Vec<f64> = ts
+                        .iter()
+                        .map(|&t| {
+                            let dot: f64 = (0..du)
+                                .map(|c| qh[(h * lu + qi) * du + c] as f64 * key(t, c) as f64)
+                                .sum();
+                            let dist = p - t;
+                            dot * scale
+                                + if dist < ru {
+                                    relh[(qi * HQ as usize + h) * ru + dist] as f64
+                                } else {
+                                    0.0
+                                }
+                        })
+                        .collect();
+                    logits.push(sh[qi * HQ as usize + h] as f64);
+                    let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let wts: Vec<f64> = logits.iter().map(|x| (x - m).exp()).collect();
+                    let z: f64 = wts.iter().sum();
+                    for c in 0..du {
+                        let b = ts
+                            .iter()
+                            .zip(&wts)
+                            .map(|(&t, wt)| wt * val(t, c) as f64)
+                            .sum::<f64>()
+                            / z;
+                        let a = got[(qi * HQ as usize + h) * du + c] as f64;
+                        let tol = b.abs() * 2.0f64.powi(-7) + 1e-3;
+                        assert!(
+                            (a - b).abs() <= tol,
+                            "hist {hist} slots {rlen}/{cap} write {ridx} L {l} parts {parts} h {h} q {qi} c {c}: {a} vs {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The window's ring buffer as real caches leave it (`ring`), against the
+/// same keys in temporal order: a prefill chunk longer than the window,
+/// then decode steps (rotating), and a short chunk with steps (growing).
+#[test]
+fn window_ring_states_match_temporal_order() {
+    use calamardo_model::cache::RotatingKvCache;
+    let kern = Kernels::new().unwrap();
+    let w = 64;
+    let tok = |n: i32, seed: u32| bf16(data((HKV * n * D) as usize, seed, 1.5), &[1, HKV, n, D]);
+    // (prefill chunk, decode steps after it)
+    for (chunk, steps) in [(80, 0), (80, 1), (80, 37), (20, 0), (20, 9), (20, 70)] {
+        let mut c = RotatingKvCache::new(w);
+        c.update_and_fetch(&tok(chunk, 70), &tok(chunk, 71))
+            .unwrap();
+        for i in 0..steps {
+            c.update_and_fetch(&tok(1, 72 + i as u32), &tok(1, 300 + i as u32))
+                .unwrap();
+        }
+        let (rk, rv, rlen, ridx) = c.ring().unwrap();
+        let (tk, tv) = c.temporal().unwrap();
+        let tlen = tk.shape()[2];
+        for l in [2, 6] {
+            let q = bf16(data((HQ * l * D) as usize, 81, 0.2), &[1, HQ, l, D]);
+            let (nk, nv) = (tok(l, 82), tok(l, 83));
+            let rel = bf16(data((l * HQ * w) as usize, 84, 1.0), &[1, l, HQ, w]);
+            let sinks = bf16(data((l * HQ) as usize, 85, 2.0), &[1, l, HQ]);
+            let run = |k: &Array, v: &Array, n: i32, i: i32| {
+                host(
+                    &kern
+                        .window_verify_attention(&q, k, v, n, i, &nk, &nv, &rel, &sinks, 0.088, w)
+                        .unwrap(),
+                )
+            };
+            let (a, b) = (run(rk, rv, rlen, ridx), run(&tk, &tv, tlen, tlen));
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= y.abs() * 2.0f32.powi(-7) + 1e-3,
+                    "chunk {chunk} + {steps} steps (slots {rlen}, write {ridx}) L {l} [{i}]: {x} vs {y}"
+                );
+            }
+        }
+    }
+}

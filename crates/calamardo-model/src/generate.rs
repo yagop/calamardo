@@ -439,13 +439,20 @@ impl<'m> Session<'m> {
     }
 
     /// Benchmarks only: one target forward over `tokens`, as a prefill
-    /// chunk or (`verify`) as a speculative verification, kept in the
-    /// session (no rewind). Returns the seconds until its results exist.
+    /// chunk or (`verify`) as a speculative verification with every token
+    /// accepted. Returns the seconds until its results exist.
     #[doc(hidden)]
     pub fn bench_forward(&mut self, tokens: &[u32], verify: bool) -> Result<f64> {
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let t = std::time::Instant::now();
         let (logits, _) = self.forward(&Array::from_slice(&ids, &[1, ids.len() as i32]), verify)?;
+        if verify {
+            // Keep every token, as a fully accepted round would.
+            let n = ids.len() as i32;
+            for c in &mut self.cache {
+                c.rewind(n, n)?;
+            }
+        }
         ops::eval(&[&logits])?;
         self.eval_state()?;
         self.tokens.extend_from_slice(tokens);

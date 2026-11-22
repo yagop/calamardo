@@ -360,7 +360,7 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
 - Lo que hacía lenta la especulación a 512k (6,7 tok/s en el servidor) era la atención con varias consultas:
   - El kernel de decode por carriles guarda en registros las G × L filas de consulta y se desborda a partir de 2 consultas. Con 8 bits a 516k, por pasada: 3,6 ms con 1 consulta, 16,7 con 3 y 168 con 7.
   - En el drafter, su capa global concatenaba toda su caché bf16 (copia de 2 GB, 10 ms) y usaba la atención de MLX con 8 consultas (19 ms).
-- Kernel nuevo (`QUANT_VERIFY_PARTIAL_SOURCE`): cada simdgroup lleva 8 filas de consulta sobre una parte de las claves de una cabeza KV. Lee claves y valores de la caché directamente a registros de matriz, descomprimidos como `mx.dequantize`, y multiplica con matrices 8×8 en float. El softmax en línea se hace sobre los propios registros. Sin memoria de grupo ni barreras: la versión que montaba bloques en memoria de grupo era 2–4 veces más lenta. La pasada de reducción es la del kernel de decode.
+- Kernel nuevo (`quant_verify_source`, hoy repartido en `VERIFY_HEAD`, un preludio de claves y `VERIFY_BODY`): cada simdgroup lleva 8 filas de consulta sobre una parte de las claves de una cabeza KV. Lee claves y valores de la caché directamente a registros de matriz, descomprimidos como `mx.dequantize`, y multiplica con matrices 8×8 en float. El softmax en línea se hace sobre los propios registros. Sin memoria de grupo ni barreras: la versión que montaba bloques en memoria de grupo era 2–4 veces más lenta. La pasada de reducción es la del kernel de decode.
   - Hace falta desenrollar del todo los bucles sobre la dimensión de la cabeza; un índice no constante en los arrays de matrices los manda a memoria y es 4–5 veces más lento.
   - Tiene un modo bidireccional sin bias ni sumidero para el bloque del drafter: sus 8 claves se escriben tras el contexto en el propio buffer de la caché y se descartan al terminar. El historial no se copia salvo cuando el buffer tiene que crecer o lo comparte otra sesión (tras un fork), copias que el siguiente `add_context` haría de todos modos.
   - Por pasada a 516k (`bench_speculative_attention`):
@@ -426,7 +426,23 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
 
   Forward de verificación con texto real: 2 tokens 38,9 ms (antes 40,8) y 4 tokens 44,3 ms (antes 48,9). Ronda de bloque 4 a 1k: 50,5 ms por 3,1 tokens (antes 53,8).
 - Servidor con la prueba de Ollama (~29k, razonamiento «low», caché bf16, sin caché de prefijos): con drafter 34,7 / 42,9 / 41,5 tok/s (mediana 41,5; antes 35,9), con aceptación del 35–58 %; sin drafter 31,8 tok/s. Ollama hacía 36,7. Primer objetivo de ≥ 40 tok/s a 29k alcanzado en la mediana, aunque depende de la aceptación de cada respuesta.
-- Lo siguiente con más peso: pasar de 1 a 2 tokens añade ~8 ms fuera de los expertos. Casi todo está en las 40 pasadas de ventana. Con más de un token siguen el camino de la referencia, que reordena la ventana y le concatena las claves nuevas: varias copias de ~4 MB por pasada, más un recorte en el siguiente decode. Las proyecciones densas bf16 apenas cuentan (menos de 1 ms).
+- Lo siguiente con más peso: pasar de 1 a 2 tokens añade ~8 ms fuera de los expertos. Casi todo está en las 40 pasadas de ventana. Con más de un token siguen el camino de la referencia, que reordena la ventana y le concatena las claves nuevas: varias copias de ~4 MB por pasada, más un recorte en el siguiente decode. Las proyecciones densas bf16 apenas cuentan (menos de 1 ms). Resuelto en el apartado siguiente.
+
+**Ventanas deslizantes en la verificación (22 de noviembre de 2026)**
+
+- En la verificación (2 a 8 tokens), las 40 pasadas de ventana ya no tocan su caché. Las claves nuevas esperan aparte (`PassCache.pending`) y el kernel de verificación con matrices lee el búfer circular tal como está más esas claves. La posición de cada hueco se deduce del índice de escritura, sin copiar la ventana a orden temporal. Al rebobinar, las claves aceptadas se escriben una a una en el búfer, como lo haría un decode; las rechazadas no dejan rastro.
+- El kernel comparte el cuerpo con el de la caché global. Solo cambia un preludio que da la fila y la posición de cada clave, y se añade la máscara de ventana. Comprobado frente a float64 con la ventana llena y rotada, a medio llenar y más larga que la ventana en orden temporal (tras un trozo de prefill), de 1 a 8 consultas.
+- El decode normal y el prefill no cambian: la paridad con la referencia sigue exacta.
+- Forward de verificación (caché de 8 bits, contexto de 1k): 2 tokens 32,8 ms (antes 38,9; 40,8 antes de K-7) y 4 tokens 39,0 ms (antes 44,3). Pasar de 1 a 2 tokens ya cuesta 2,4 ms más que un decode, en vez de 10.
+- Rondas (`bench_speculative_round`, caché bf16):
+
+  | Contexto | Decode | Bloque 2 | Bloque 4 | Bloque 8 |
+  |---|---|---|---|---|
+  | 1k | 28,9 ms | 38,5 ms → 1,9 tok | 45,5 ms → 3,1 tok | 64,5 ms → 3,9 tok |
+  | 31k | 30,8 ms | 41,4 ms → 2,0 tok | 48,3 ms → 3,6 tok | 68,1 ms → 3,1 tok |
+
+  Con K-7 y sin este cambio: 44,3, 50,5 y 69,2 ms a 1k; 47,4, 53,5 y 73,2 ms a 31k.
+- Servidor con la prueba de Ollama (~29k, razonamiento «low», caché bf16): con drafter 39,2 / 52,9 / 51,5 tok/s (mediana 51,5; antes 41,5) con aceptación del 36–60 %; sin drafter 31,9. Ollama hacía 36,7.
 
 **Incoherencias a resolver**
 

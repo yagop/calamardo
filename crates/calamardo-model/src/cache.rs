@@ -234,6 +234,14 @@ impl RotatingKvCache {
         }
     }
 
+    /// The buffers as they are, with the number of filled slots and the
+    /// next write slot (slot s was written (idx - 1 - s) mod filled steps
+    /// before the last token).
+    pub fn ring(&self) -> Option<(&Array, &Array, i32, i32)> {
+        let (k, v) = (self.keys.as_ref()?, self.values.as_ref()?);
+        Some((k, v, self.offset.min(k.shape()[2]), self.idx))
+    }
+
     /// The cached keys and values, oldest first.
     pub fn temporal(&self) -> Result<(Array, Array)> {
         let k = self.keys.as_ref().context("empty window cache")?;
@@ -462,6 +470,10 @@ pub struct PassCache {
     /// The current forward is a speculative verification (set and cleared
     /// by the layer around its attention).
     pub verifying: bool,
+    /// Keys and values (B, Hkv, L, D) of the last verification of a
+    /// sliding-window pass, not yet in its window: `rewind` writes the
+    /// accepted ones.
+    pub pending: Option<(Array, Array)>,
 }
 
 impl PassCache {
@@ -473,6 +485,9 @@ impl PassCache {
         };
         out.extend(self.conv.iter().flatten());
         out.extend(self.windows.iter().flatten());
+        if let Some((k, v)) = &self.pending {
+            out.extend([k, v]);
+        }
         out
     }
 }
@@ -519,6 +534,7 @@ impl PassCache {
     /// the current state).
     pub fn restore(&mut self, snap: &PassSnapshot) {
         self.windows = None;
+        self.pending = None;
         match (snap, &mut self.attn) {
             (PassSnapshot::Window { cache, conv }, AttnCache::Window(c)) => {
                 *c = cache.clone();
@@ -636,6 +652,10 @@ impl PassCache {
     /// Adds this pass's state under prefix `p`. Buffers are saved whole (no
     /// slicing copy); the offsets say how much is valid.
     pub fn export(&self, p: &str, out: &mut Saved) {
+        debug_assert!(
+            self.pending.is_none(),
+            "saving in the middle of a verification"
+        );
         match &self.attn {
             AttnCache::Global(c) => {
                 if let (Some(k), Some(v)) = (&c.keys, &c.values) {
@@ -737,10 +757,21 @@ impl PassCache {
     /// the first `keep` of them (rejected drafts leave no trace).
     pub fn rewind(&mut self, fed: i32, keep: i32) -> Result<()> {
         let drop = fed - keep;
-        match &mut self.attn {
-            AttnCache::Global(c) => c.truncate(c.offset - drop),
-            AttnCache::Quantized(c) => c.truncate(c.offset - drop),
-            AttnCache::Window(c) => c.drop_last(drop)?,
+        match (&mut self.attn, self.pending.take()) {
+            (AttnCache::Window(c), Some((k, v))) => {
+                // The window was left as it was: the accepted tokens go in
+                // one by one, as decode steps would write them.
+                anyhow::ensure!(k.shape()[2] == fed, "pending keys of another verification");
+                for i in 0..keep {
+                    let ki = ops::slice(&k, 2, i, i + 1, 1)?;
+                    let vi = ops::slice(&v, 2, i, i + 1, 1)?;
+                    drop_views(c.update_and_fetch(&ki, &vi)?);
+                }
+            }
+            (_, Some(_)) => anyhow::bail!("pending window keys on a global pass"),
+            (AttnCache::Global(c), None) => c.truncate(c.offset - drop),
+            (AttnCache::Quantized(c), None) => c.truncate(c.offset - drop),
+            (AttnCache::Window(c), None) => c.drop_last(drop)?,
         }
         let windows = self.windows.take();
         anyhow::ensure!(
@@ -761,6 +792,10 @@ impl PassCache {
         Ok(())
     }
 }
+
+/// Drops the views a cache update returns, so the buffers are not shared
+/// when the next update writes them.
+fn drop_views(_: (Array, Array)) {}
 
 /// Capacity kept after a fork: the valid tokens rounded up to a block.
 fn shrunk(offset: i32) -> i32 {

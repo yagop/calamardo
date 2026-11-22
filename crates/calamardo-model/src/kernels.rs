@@ -510,8 +510,20 @@ const QUANT_DECODE_REDUCE_SOURCE: &str = r#"
 // sends them to memory (4-5x slower). The partial results have the layout of
 // the per-lane kernel, so the same pass 2 merges them. CAUSAL = 0 lets every
 // query see every key (the drafter's bidirectional block); R = 0 skips the
-// bias.
-const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
+// bias; WINDOW > 0 hides keys that many positions back or more. The body
+// reads key v through `key_row`, `val_row` and `key_pos`, which a prelude
+// defines: rows of a contiguous cache (VERIFY_PLAIN_KEYS), or a sliding
+// window's ring buffer followed by the keys being verified
+// (VERIFY_RING_KEYS, `window_verify_attention`).
+fn quant_verify_source() -> String {
+    format!("{VERIFY_HEAD}{VERIFY_PLAIN_KEYS}{VERIFY_BODY}")
+}
+
+fn window_verify_source() -> String {
+    format!("{VERIFY_HEAD}{VERIFY_RING_KEYS}{VERIFY_BODY}")
+}
+
+const VERIFY_HEAD: &str = r#"
     constexpr float LOG2E = 1.4426950408889634f;
     constexpr int GL = G * L;
     constexpr int ROW_BYTES = D * BITS / 8;
@@ -549,14 +561,50 @@ const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
     float m = -INFINITY;
     float ssum = 0.0f;
 
-    const device uint8_t* kbytes = (const device uint8_t*)kw + size_t(kvh) * cap * ROW_BYTES;
+"#;
+
+const VERIFY_PLAIN_KEYS: &str = r#"    const device uint8_t* kbytes = (const device uint8_t*)kw + size_t(kvh) * cap * ROW_BYTES;
     const device uint8_t* vbytes = (const device uint8_t*)vw + size_t(kvh) * cap * ROW_BYTES;
     const device T* ksc = ks + size_t(kvh) * cap * NG;
     const device T* kbi = kb + size_t(kvh) * cap * NG;
     const device T* vsc = vs + size_t(kvh) * cap * NG;
     const device T* vbi = vb + size_t(kvh) * cap * NG;
 
-    const int per = (S + NB - 1) / NB;
+    // Key v is row v of the cache, at position v.
+    auto key_row = [&](int v) { return kbytes + size_t(v) * ROW_BYTES; };
+    auto val_row = [&](int v) { return vbytes + size_t(v) * ROW_BYTES; };
+    auto key_pos = [&](int v) { return v; };
+
+"#;
+
+const VERIFY_RING_KEYS: &str = r#"    // A bf16 sliding window: keys 0..rlen-1 are the ring buffer's filled
+    // slots (slot v was written (ridx - 1 - v) mod rlen steps ago), then the
+    // L keys of this verification, not yet in the buffer. Positions count
+    // from the oldest slot, so the queries are at rlen..rlen+L-1.
+    const int rlen = sizes[2];
+    const int ridx = sizes[3];
+    const device uint8_t* kbytes = (const device uint8_t*)kw + size_t(kvh) * cap * ROW_BYTES;
+    const device uint8_t* vbytes = (const device uint8_t*)vw + size_t(kvh) * cap * ROW_BYTES;
+    const device uint8_t* nkb = (const device uint8_t*)nk + size_t(kvh) * L * ROW_BYTES;
+    const device uint8_t* nvb = (const device uint8_t*)nv + size_t(kvh) * L * ROW_BYTES;
+    // Not read for 16 bits.
+    const device T* ksc = q;
+    const device T* kbi = q;
+    const device T* vsc = q;
+    const device T* vbi = q;
+    auto key_row = [&](int v) {
+        return v < rlen ? kbytes + size_t(v) * ROW_BYTES : nkb + size_t(v - rlen) * ROW_BYTES;
+    };
+    auto val_row = [&](int v) {
+        return v < rlen ? vbytes + size_t(v) * ROW_BYTES : nvb + size_t(v - rlen) * ROW_BYTES;
+    };
+    auto key_pos = [&](int v) {
+        return v < rlen ? rlen - 1 - (ridx - 1 - v + rlen) % rlen : v;
+    };
+
+"#;
+
+const VERIFY_BODY: &str = r#"    const int per = (S + NB - 1) / NB;
     const int j0 = part * per;
     const int j1 = min(S, j0 + per);
     constexpr int DG = BITS == 16 ? DT : GROUP / 8; // 8-wide tiles per quantization group
@@ -569,8 +617,8 @@ const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
             // part: out-of-range keys get a -inf score below.
             const int ka = min(jt + c8 * 8 + fn, j1 - 1);
             const int kb2 = min(jt + c8 * 8 + fn + 1, j1 - 1);
-            const device uint8_t* ra = kbytes + size_t(ka) * ROW_BYTES;
-            const device uint8_t* rb = kbytes + size_t(kb2) * ROW_BYTES;
+            const device uint8_t* ra = key_row(ka);
+            const device uint8_t* rb = key_row(kb2);
             sc[c8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             float sa = 0.0f, ba = 0.0f, sb = 0.0f, bb = 0.0f;
             _Pragma("clang loop unroll(full)")
@@ -600,11 +648,12 @@ const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
             _Pragma("clang loop unroll(full)")
             for (int e = 0; e < 2; e++) {
                 const int jj = jt + c8 * 8 + fn + e;
+                const int kp = key_pos(jj);
                 float s = -INFINITY;
-                if (row_ok && jj < j1 && (CAUSAL == 0 || jj <= pos)) {
+                if (row_ok && jj < j1 && (CAUSAL == 0 || kp <= pos) && (WINDOW == 0 || pos - kp < WINDOW)) {
                     s = sc[c8].thread_elements()[e] * scale;
                     if (R > 0) {
-                        const int dist = pos - jj;
+                        const int dist = pos - kp;
                         if (dist >= 0 && dist < R) {
                             s += float(rel[(size_t(lr) * HQ + hr) * R + dist]);
                         }
@@ -643,7 +692,7 @@ const QUANT_VERIFY_PARTIAL_SOURCE: &str = r#"
         for (int c8 = 0; c8 < KS / 8; c8++) {
             // V: element (key fm, dim fn) and (key fm, dim fn + 1).
             const int kvr = min(jt + c8 * 8 + fm, j1 - 1);
-            const device uint8_t* vrow = vbytes + size_t(kvr) * ROW_BYTES;
+            const device uint8_t* vrow = val_row(kvr);
             float vsf = 0.0f, vbf = 0.0f;
             _Pragma("clang loop unroll(full)")
             for (int d = 0; d < DT; d++) {
@@ -844,6 +893,8 @@ const GATHER_QMV_SHARED_SOURCE: &str = r#"
 pub const DECODE_PARTS: i32 = 512;
 /// Fewest keys per part, so short contexts do not pay for many parts.
 const KEYS_PER_PART: i32 = 256;
+/// Keys per part of the window verification (about 1k keys in all).
+const WINDOW_KEYS_PER_PART: i32 = 64;
 /// Most queries the quantized decode attention takes at once.
 pub const MAX_DECODE_QUERIES: i32 = 8;
 
@@ -964,6 +1015,7 @@ pub struct Kernels {
     quant_verify: MetalKernel,
     relative_quant: MetalKernel,
     gather_qmv_shared: MetalKernel,
+    window_verify: MetalKernel,
     /// Key parts per KV head of the quantized decode attention; 0 adapts to
     /// the context length.
     pub decode_parts: i32,
@@ -974,6 +1026,8 @@ pub struct Kernels {
     pub matrix_from: i32,
     /// Fewest keys from which a single query takes the matrix kernel too.
     pub matrix_decode_from: i32,
+    /// Key parts per KV head of the window verification; 0 adapts.
+    pub window_parts: i32,
 }
 
 impl Kernels {
@@ -1019,7 +1073,7 @@ impl Kernels {
                     "q", "kw", "ks", "kb", "vw", "vs", "vb", "rel", "sizes", "scale",
                 ],
                 &["pm", "ps", "po"],
-                QUANT_VERIFY_PARTIAL_SOURCE,
+                &quant_verify_source(),
                 contiguous.clone(),
             ))?,
             quant_reduce: ops::with_mlx_message(MetalKernel::new(
@@ -1049,6 +1103,13 @@ impl Kernels {
                 &quant_relative_source()?,
                 MetalKernelOptions::default(),
             ))?,
+            window_verify: ops::with_mlx_message(MetalKernel::new(
+                "window_verify_partial",
+                &["q", "kw", "vw", "nk", "nv", "rel", "sizes", "scale"],
+                &["pm", "ps", "po"],
+                &window_verify_source(),
+                contiguous.clone(),
+            ))?,
             gather_qmv_shared: ops::with_mlx_message(MetalKernel::new(
                 "gather_qmv_shared",
                 &["x", "w", "scales", "gs", "indices"],
@@ -1066,6 +1127,7 @@ impl Kernels {
             // per lane; about even at 160k, slightly slower on short
             // contexts (see bench_speculative_attention).
             matrix_decode_from: 256 * 1024,
+            window_parts: 0,
         })
     }
 
@@ -1364,6 +1426,7 @@ impl Kernels {
             ),
             int("R", if causal { rel.shape()[3] } else { 0 }),
             int("CAUSAL", causal as i32),
+            int("WINDOW", 0),
             // Keys per step of the matrix kernel: 8, 16 and 32 were within
             // 5% of each other at 516k tokens.
             int("KS", 16),
@@ -1421,15 +1484,31 @@ impl Kernels {
                 },
             ))?
         };
-        // SAFETY: one simdgroup per (KV head, query); reads the parts above.
+        self.reduce_parts(&partial, &sinks, template_args, &q)
+    }
+
+    /// Pass 2 of the split-key kernels: merges the parts of every (KV head,
+    /// query) with its sink. Returns (1, L, Hq, D) in q's dtype.
+    fn reduce_parts(
+        &self,
+        partial: &[Array],
+        sinks: &Array,
+        template_args: Vec<(String, TemplateArg)>,
+        q: &Array,
+    ) -> Result<Array> {
+        let [_, hq, l, d] = q.shape()[..] else {
+            unreachable!()
+        };
+        // SAFETY: one simdgroup per (KV head, query); reads the parts of
+        // pass 1, laid out as its template arguments say.
         let out = unsafe {
             ops::with_mlx_message(self.quant_reduce.apply(
-                &[&partial[0], &partial[1], &partial[2], &sinks],
+                &[&partial[0], &partial[1], &partial[2], sinks],
                 &[MetalKernelOutput {
                     shape: vec![1, l, hq, d],
                     dtype: q.dtype(),
                 }],
-                (hkv * gl * 32, 1, 1),
+                (hq * l * 32, 1, 1),
                 (32, 1, 1),
                 MetalKernelApplyOptions {
                     template_args,
@@ -1438,6 +1517,110 @@ impl Kernels {
             ))?
         };
         Ok(out.into_iter().next().unwrap())
+    }
+
+    /// Speculative verification over a bf16 sliding window without
+    /// touching it: q (1, Hq, L, D) at the positions after the window; the
+    /// ring buffer (1, Hkv, capacity, D) with `rlen` filled slots and its
+    /// next write slot `ridx`; the L new keys and values (1, Hkv, L, D),
+    /// not yet in the buffer. Each query sees the keys less than `window`
+    /// positions back, itself included. rel: (1, L, Hq, R); sinks:
+    /// (1, L, Hq). Returns (1, L, Hq, D).
+    #[allow(clippy::too_many_arguments)]
+    pub fn window_verify_attention(
+        &self,
+        q: &Array,
+        ring_k: &Array,
+        ring_v: &Array,
+        rlen: i32,
+        ridx: i32,
+        new_k: &Array,
+        new_v: &Array,
+        rel: &Array,
+        sinks: &Array,
+        scale: f32,
+        window: i32,
+    ) -> Result<Array> {
+        let [b, hq, l, d] = q.shape()[..] else {
+            unreachable!()
+        };
+        let [_, hkv, cap, _] = ring_k.shape()[..] else {
+            anyhow::bail!("window buffer must be (1, Hkv, capacity, D)")
+        };
+        anyhow::ensure!(
+            b == 1
+                && (1..=MAX_DECODE_QUERIES).contains(&l)
+                && d % 32 == 0
+                && [q, ring_k, ring_v, new_k, new_v]
+                    .iter()
+                    .all(|a| a.dtype() == Dtype::Bfloat16)
+                && ring_v.shape() == ring_k.shape()
+                && new_k.shape() == [1, hkv, l, d]
+                && new_v.shape() == [1, hkv, l, d]
+                && 0 < rlen
+                && rlen <= cap
+                && (0..=rlen).contains(&ridx)
+                && window > 0,
+            "unsupported window verification: L {l}, {rlen} of {cap} slots, write slot {ridx}"
+        );
+        let g = hq / hkv;
+        let gl = g * l;
+        let len = rlen + l;
+        let parts = match self.window_parts {
+            0 => (len / WINDOW_KEYS_PER_PART).clamp(1, DECODE_PARTS),
+            p => p,
+        };
+        let template_args = vec![
+            ("T".to_string(), TemplateArg::Dtype(q.dtype())),
+            int("D", d),
+            int("G", g),
+            int("L", l),
+            int("HKV", hkv),
+            int("BITS", 16),
+            int("GROUP", 64),
+            int("NB", parts),
+            int("KPS", 1),
+            int("R", rel.shape()[3]),
+            int("CAUSAL", 1),
+            int("WINDOW", window),
+            int("KS", 16),
+        ];
+        let q = ops::contiguous(q)?;
+        let rel = ops::contiguous(rel)?;
+        let sinks = ops::contiguous(&ops::f32(sinks)?)?;
+        let sizes = Array::from_slice(&[len, cap, rlen, ridx], &[4]);
+        let scale = f32s(scale);
+        let n = hkv * parts * gl;
+        let threads = (gl + 7) / 8 * 32;
+        // SAFETY: one simdgroup per 8 query rows of a (part, KV head) pair;
+        // the virtual keys 0..len map to the rlen filled slots and the L new
+        // rows, all within the shapes checked above.
+        let partial = unsafe {
+            ops::with_mlx_message(self.window_verify.apply(
+                &[&q, ring_k, ring_v, new_k, new_v, &rel, &sizes, &scale],
+                &[
+                    MetalKernelOutput {
+                        shape: vec![n],
+                        dtype: Dtype::Float32,
+                    },
+                    MetalKernelOutput {
+                        shape: vec![n],
+                        dtype: Dtype::Float32,
+                    },
+                    MetalKernelOutput {
+                        shape: vec![n * d],
+                        dtype: Dtype::Float32,
+                    },
+                ],
+                (parts * threads, hkv, 1),
+                (threads, 1, 1),
+                MetalKernelApplyOptions {
+                    template_args: template_args.clone(),
+                    ..Default::default()
+                },
+            ))?
+        };
+        self.reduce_parts(&partial, &sinks, template_args, &q)
     }
 
     /// `gather_qmm` (nvfp4, mxfp4 or mxfp8, transposed weights) for a few
