@@ -496,6 +496,10 @@ impl PassCache {
 /// does not keep the window alive (`_conv_state` with no lengths).
 pub fn conv_state(window: &Array, n: i32) -> Result<Array> {
     let w = window.shape()[1];
+    if w == n {
+        // Already a state of its own (a decode step's kernel output).
+        return Ok(window.clone());
+    }
     // A new buffer in one kernel (K-6), with the values `take_along_axis`
     // gives: x * 1 is x for every float, -0 and NaN included. (`mx.copy`
     // would share the window's buffer and keep it alive.)
@@ -787,6 +791,11 @@ impl PassCache {
                 // The window is the previous state followed by the `fed`
                 // inputs; the state after `keep` of them starts at row `keep`.
                 let n = state.as_ref().context("convolution state")?.shape()[1];
+                anyhow::ensure!(
+                    window.shape()[1] == n + fed,
+                    "convolution window of {} rows for {fed} fed tokens",
+                    window.shape()[1]
+                );
                 let pos = ops::reshape(&ops::arange(keep, keep + n)?, &[1, n, 1])?;
                 *state = Some(ops::take_along_axis(window, &pos, 1)?);
             }

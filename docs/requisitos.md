@@ -464,6 +464,15 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
   - Juntar las proyecciones con la misma entrada (q, r y puerta; también k y v en las ventanas sin mensajes). En decode es exacto: MLX elige la misma variante de `gemv` para esos tamaños, pero no para la de sumideros (N = 24), y en prefill cambia el tiling.
   - La atención en profundidad (~8 µs por llamada).
 
+**K-6, segunda ronda (22 de noviembre de 2026)**
+
+- Proyecciones con la misma entrada en un solo gemv (decode, un token): q, r y puerta en todas las pasadas, más k y v en las de ventana sin mensajes. Los pesos se apilan al cargar y los de cada proyección quedan como vistas, sin duplicar memoria. Es exacto: MLX elige la misma reducción por fila para esos tamaños y para la matriz apilada (test bit a bit). La de sumideros (N = 24) queda aparte porque MLX la reduce de otra forma.
+- Pesos de las normas RMS también en float32: el `rms_norm` de MLX convierte el peso al tipo de una entrada float32 en cada llamada (un kernel). Con la copia float32 el resultado es el mismo.
+- El kernel de convolución corta escribe directamente el estado siguiente (sin copia aparte). Para las dos convoluciones cuyo resultado se pasa a float32 enseguida, lo devuelve ya en float32 con el mismo valor redondeado a bf16.
+- Probado sin ganancia y descartado: otros repartos de filas en el kernel de expertos y desenrollar su bucle. Ninguno mejora la disposición de MLX (4 filas × 2 simdgroups) más allá del ruido.
+- Resultado: 3.790 kernels por token. Decode a 1k: 22,4 ms; a 31k: 24,7 ms. Tiempo de GPU por paso: 20,4 ms (unos 13,4 en los productos grandes y unos 7 en los ~3.500 kernels pequeños que quedan). Quitar más kernels pequeños ya rinde poco, ~1 µs cada uno.
+- Perfiles sin Xcode: la captura de GPU de MLX (`MTL_CAPTURE_ENABLED=1`) funciona y el reproductor de Apple (`MTLReplayer.app`) viene con macOS. Con gputrace-rs se obtienen kernels y despachos reales, pero los tiempos por kernel necesitan el modelo de costes de Xcode y las cifras por shader sin él no son fiables. El test ignorado `capture_decode_step` captura un paso de decode por si algún día se instala Xcode.
+
 **Incoherencias a resolver**
 
 1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k. Resuelto en la práctica: Calamardo hace 401 tok/s a 145k y 5,3 min en frío.

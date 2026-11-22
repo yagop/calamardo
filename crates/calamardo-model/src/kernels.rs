@@ -927,7 +927,9 @@ const DECODE_MASK_SOURCE: &str = r#"
 // in bfloat (`acc += float(in) * w` tap by tap, as its depthwise_conv_1d
 // kernel; products of two bfloats are exact in float, so only this order
 // matters), the residual and the scaling, as the ops do one by one.
-// Outputs the result and the window (for the next state).
+// Outputs the result (in T, or float32 holding the same T-rounded value,
+// for callers that would cast it to float32 next) and the next state (the
+// window's last K - 1 rows, in a buffer of its own).
 const SHORT_CONV_SOURCE: &str = r#"
     const int c = int(thread_position_in_grid.x);
     if (c >= C) {
@@ -937,12 +939,15 @@ const SHORT_CONV_SOURCE: &str = r#"
     float acc = 0.0f;
     for (int i = 0; i < K; i++) {
         const float v = i < K - 1 ? state[i * C + c] : xf;
-        win[i * C + c] = v;
+        if (i > 0) {
+            next[(i - 1) * C + c] = v;
+        }
         acc += float(T(v)) * float(w[c * K + i]);
     }
     const float conv = float(T(acc));
     const float y = conv + xf;
-    out[c] = T(y / denom);
+    // Rounded to T once; stored as T, or exactly as that value in float.
+    out[c] = OT(T(y / denom));
 "#;
 
 /// Most key parts per KV head of the quantized decode attention (K-4). On M4
@@ -1168,7 +1173,7 @@ impl Kernels {
             short_conv: ops::with_mlx_message(MetalKernel::new(
                 "short_conv_step",
                 &["x", "state", "w", "denom"],
-                &["out", "win"],
+                &["out", "next"],
                 SHORT_CONV_SOURCE,
                 contiguous.clone(),
             ))?,
@@ -1799,14 +1804,15 @@ impl Kernels {
 
     /// One decode step of a static short convolution (K-6): x (1, 1, C) in
     /// the weights' dtype, state (1, K - 1, C) float32, weight (C, K)
-    /// contiguous. Returns the output (1, 1, C) and the window (1, K, C)
-    /// float32, as `ShortConvolution::forward` computes them.
+    /// contiguous. Returns the output (1, 1, C) and the next state
+    /// (1, K - 1, C) float32: the window's last K - 1 rows.
     pub fn short_conv_step(
         &self,
         x: &Array,
         state: &Array,
         weight: &Array,
         denom: f32,
+        out_f32: bool,
     ) -> Result<(Array, Array)> {
         let [c, k] = weight.shape()[..] else {
             anyhow::bail!("short convolution weight must be (C, K)")
@@ -1830,10 +1836,10 @@ impl Kernels {
                 &[
                     MetalKernelOutput {
                         shape: vec![1, 1, c],
-                        dtype: x.dtype(),
+                        dtype: if out_f32 { Dtype::Float32 } else { x.dtype() },
                     },
                     MetalKernelOutput {
-                        shape: vec![1, k, c],
+                        shape: vec![1, k - 1, c],
                         dtype: Dtype::Float32,
                     },
                 ],
@@ -1842,6 +1848,10 @@ impl Kernels {
                 MetalKernelApplyOptions {
                     template_args: vec![
                         ("T".to_string(), TemplateArg::Dtype(x.dtype())),
+                        (
+                            "OT".to_string(),
+                            TemplateArg::Dtype(if out_f32 { Dtype::Float32 } else { x.dtype() }),
+                        ),
                         int("C", c),
                         int("K", k),
                     ],

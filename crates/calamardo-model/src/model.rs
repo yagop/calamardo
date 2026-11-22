@@ -128,10 +128,24 @@ impl ShortConvolution {
         })
     }
 
-    /// Returns the output and the window (state + input) for the next state.
-    fn forward(&self, kern: &Kernels, x: &Array, state: Option<&Array>) -> Result<(Array, Array)> {
+    /// Returns the output and the window (state + input) for the next state;
+    /// a decode step returns the next state itself (the window's last
+    /// K - 1 rows, which `conv_state` then keeps as is). `f32_out`: the
+    /// caller casts the output to float32 next; a decode step then returns
+    /// it already as float32 (the same values, K-6). `keep_window`: return
+    /// the full window even for one token (speculative verification).
+    fn forward(
+        &self,
+        kern: &Kernels,
+        x: &Array,
+        state: Option<&Array>,
+        f32_out: bool,
+        keep_window: bool,
+    ) -> Result<(Array, Array)> {
         let k = self.kernel_size;
+        // A verification keeps the whole window to rewind with.
         if let Some(state) = state
+            && !keep_window
             && x.shape()[..2] == [1, 1]
             && x.dtype() == self.weight.dtype()
         {
@@ -142,6 +156,7 @@ impl ShortConvolution {
                 state,
                 &ops::reshape(&self.weight, &[c, k])?,
                 ((k + 1) as f64).sqrt() as f32,
+                f32_out,
             );
         }
         let residual = ops::f32(x)?;
@@ -266,6 +281,12 @@ fn l2_clip(x: &Array, scale: Option<&Array>, threshold: f32) -> Result<Array> {
 }
 
 struct Attention {
+    /// q, r and gate projections stacked by rows, then k and v on sliding
+    /// passes (their inputs are the same there when no messages mix in):
+    /// one gemv for all of them in decode (K-6; the same rows bit for bit,
+    /// MLX takes the same reduction for these sizes). The single
+    /// projections below are views of it.
+    merged: Array,
     q_proj: Array,
     k_proj: Array,
     v_proj: Array,
@@ -339,13 +360,36 @@ impl Attention {
                 0,
             )
         };
+        let q = w.take(&format!("{p}.wq_du.weight"))?;
+        let r = w.take(&format!("{p}.wr_du.weight"))?;
+        let g = w.take(&format!("{p}.gate_attn.weight"))?;
+        let kp = w.take(&format!("{p}.wk_dv.weight"))?;
+        let vp = w.take(&format!("{p}.wv_dv.weight"))?;
+        let mut parts = vec![&q, &r, &g];
+        if sliding {
+            parts.extend([&kp, &vp]);
+        }
+        let merged = ops::concatenate(&parts, 0)?;
+        let mut start = 0;
+        let mut rows = |a: &Array| -> Result<Array> {
+            let n = a.shape()[0];
+            start += n;
+            ops::slice(&merged, 0, start - n, start, 1)
+        };
+        let (q_proj, r_proj, gate_proj) = (rows(&q)?, rows(&r)?, rows(&g)?);
+        let (k_proj, v_proj) = if sliding {
+            (rows(&kp)?, rows(&vp)?)
+        } else {
+            (kp, vp)
+        };
         Ok(Self {
-            q_proj: w.take(&format!("{p}.wq_du.weight"))?,
-            k_proj: w.take(&format!("{p}.wk_dv.weight"))?,
-            v_proj: w.take(&format!("{p}.wv_dv.weight"))?,
-            r_proj: w.take(&format!("{p}.wr_du.weight"))?,
+            merged,
+            q_proj,
+            k_proj,
+            v_proj,
+            r_proj,
             o_proj: w.take(&format!("{p}.wo_ud.weight"))?,
-            gate_proj: w.take(&format!("{p}.gate_attn.weight"))?,
+            gate_proj,
             sink_proj: w.take(&format!("{p}.attn_sink_proj.weight"))?,
             rel_proj: w.take(&format!("{p}.rel_logits_proj.proj"))?,
             q_scale: w.take(&format!("{p}.q_l2_clip.scale"))?,
@@ -364,22 +408,61 @@ impl Attention {
         })
     }
 
+    /// `shared_input`: the key and value inputs are `hidden` itself.
     fn forward(
         &self,
         k: &Kernels,
         hidden: &Array,
         key_hidden: &Array,
         value_hidden: &Array,
+        shared_input: bool,
         cache: &mut PassCache,
     ) -> Result<Array> {
+        let [b, l, _] = hidden.shape()[..] else {
+            unreachable!()
+        };
+        // The projections of `hidden`: q, r, gate, then k and v when they
+        // share it. One gemv over the stacked weights in decode (K-6).
+        let rows: Vec<i32> = [
+            &self.q_proj,
+            &self.r_proj,
+            &self.gate_proj,
+            &self.k_proj,
+            &self.v_proj,
+        ]
+        .iter()
+        .map(|a| a.shape()[0])
+        .collect();
+        let with_kv = shared_input && self.merged.shape()[0] == rows.iter().sum::<i32>();
+        let projected: Option<Array> = if b == 1 && l == 1 {
+            let w = if with_kv {
+                self.merged.clone()
+            } else {
+                ops::slice(&self.merged, 0, 0, rows[0] + rows[1] + rows[2], 1)?
+            };
+            Some(ops::linear(hidden, &w)?)
+        } else {
+            None
+        };
+        let part = |i: usize, w: &Array, x: &Array| -> Result<Array> {
+            match &projected {
+                Some(p) if i < 3 || with_kv => {
+                    let start: i32 = rows[..i].iter().sum();
+                    ops::slice(p, -1, start, start + rows[i], 1)
+                }
+                _ => ops::linear(x, w),
+            }
+        };
         let (key_states, kw) = match &self.k_conv {
             KvConv::Static(c) => c.forward(
                 k,
-                &ops::linear(key_hidden, &self.k_proj)?,
+                &part(3, &self.k_proj, key_hidden)?,
                 cache.conv[0].as_ref(),
+                false,
+                cache.verifying,
             )?,
             KvConv::Dynamic(c) => c.forward(
-                &ops::linear(key_hidden, &self.k_proj)?,
+                &part(3, &self.k_proj, key_hidden)?,
                 key_hidden,
                 cache.conv[0].as_ref(),
             )?,
@@ -387,11 +470,13 @@ impl Attention {
         let (value_states, vw) = match &self.v_conv {
             KvConv::Static(c) => c.forward(
                 k,
-                &ops::linear(value_hidden, &self.v_proj)?,
+                &part(4, &self.v_proj, value_hidden)?,
                 cache.conv[1].as_ref(),
+                false,
+                cache.verifying,
             )?,
             KvConv::Dynamic(c) => c.forward(
-                &ops::linear(value_hidden, &self.v_proj)?,
+                &part(4, &self.v_proj, value_hidden)?,
                 value_hidden,
                 cache.conv[1].as_ref(),
             )?,
@@ -414,8 +499,9 @@ impl Attention {
             None
         };
 
-        let query = ops::linear(hidden, &self.q_proj)?;
-        let relative = ops::linear(hidden, &self.r_proj)?;
+        let query = part(0, &self.q_proj, hidden)?;
+        let relative = part(1, &self.r_proj, hidden)?;
+        let gate = part(2, &self.gate_proj, hidden)?;
         self.attend(
             k,
             hidden,
@@ -423,6 +509,7 @@ impl Attention {
             &key_states,
             &value_states,
             &relative,
+            &gate,
             cache,
             tau.as_ref(),
         )
@@ -437,13 +524,13 @@ impl Attention {
         key: &Array,
         value: &Array,
         relative: &Array,
+        gate: &Array,
         cache: &mut PassCache,
         tau: Option<&Array>,
     ) -> Result<Array> {
         let [b, l, _] = hidden.shape()[..] else {
             unreachable!()
         };
-        let gate = ops::linear(hidden, &self.gate_proj)?;
         let sinks = ops::linear(hidden, &self.sink_proj)?;
 
         let mut q = ops::reshape(query, &[b, l, self.num_heads, -1])?;
@@ -584,9 +671,9 @@ impl Attention {
         let out = if l <= MAX_DECODE_QUERIES {
             // One compiled function (K-6).
             kern.compiled("attention_gate", || ops::Compiled::new(gated))
-                .call1(&[&out, &gate])?
+                .call1(&[&out, gate])?
         } else {
-            gated(&[out, gate])?.remove(0)
+            gated(&[out, gate.clone()])?.remove(0)
         };
         ops::linear(&out, &self.o_proj)
     }
@@ -839,9 +926,44 @@ impl Moe {
     }
 }
 
+/// An RMS norm weight in the checkpoint's dtype and in float32. MLX's
+/// rms_norm casts the weight to a float32 input's dtype on every call (one
+/// kernel per norm); passing the float32 copy then gives the same result
+/// without it (K-6).
+struct NormWeight {
+    w: Array,
+    w32: Array,
+}
+
+impl NormWeight {
+    fn new(w: Array) -> Result<Self> {
+        Ok(Self {
+            w32: ops::f32(&w)?,
+            w,
+        })
+    }
+
+    /// The weight MLX would use for input `x`.
+    fn for_input(&self, x: &Array) -> &Array {
+        if x.dtype() == Dtype::Float32 {
+            &self.w32
+        } else {
+            &self.w
+        }
+    }
+
+    fn arrays(&self) -> [&Array; 2] {
+        [&self.w, &self.w32]
+    }
+}
+
 enum InputNorms {
-    Sliding(Array),
-    Full { q: Array, k: Array, v: Array },
+    Sliding(NormWeight),
+    Full {
+        q: NormWeight,
+        k: NormWeight,
+        v: NormWeight,
+    },
 }
 
 struct Layer {
@@ -852,7 +974,7 @@ struct Layer {
     /// float32 (1, D).
     mlp_input: Array,
     input_norms: InputNorms,
-    post_attention_layernorm: Array,
+    post_attention_layernorm: NormWeight,
     post_attention_convolution: ShortConvolution,
     post_mlp_convolution: ShortConvolution,
     attn: Attention,
@@ -879,12 +1001,12 @@ impl Layer {
             &[-1, d],
         )?;
         let input_norms = if sliding {
-            InputNorms::Sliding(w.take(&format!("{p}.attn_norm.weight"))?)
+            InputNorms::Sliding(NormWeight::new(w.take(&format!("{p}.attn_norm.weight"))?)?)
         } else {
             InputNorms::Full {
-                q: w.take(&format!("{p}.q_input_norm.weight"))?,
-                k: w.take(&format!("{p}.k_input_norm.weight"))?,
-                v: w.take(&format!("{p}.v_input_norm.weight"))?,
+                q: NormWeight::new(w.take(&format!("{p}.q_input_norm.weight"))?)?,
+                k: NormWeight::new(w.take(&format!("{p}.k_input_norm.weight"))?)?,
+                v: NormWeight::new(w.take(&format!("{p}.v_input_norm.weight"))?)?,
             }
         };
         let core = cfg.loop_config.core_start..cfg.loop_config.core_end;
@@ -906,7 +1028,7 @@ impl Layer {
             attention_input,
             mlp_input,
             input_norms,
-            post_attention_layernorm: w.take(&format!("{p}.mlp_norm.weight"))?,
+            post_attention_layernorm: NormWeight::new(w.take(&format!("{p}.mlp_norm.weight"))?)?,
             post_attention_convolution: ShortConvolution::load(
                 w,
                 &format!("{p}.attn_sconv.weight"),
@@ -969,8 +1091,8 @@ impl Layer {
         let row = |a: &Array, i: i32| -> Result<Array> {
             ops::squeeze(&ops::slice(a, -2, i, i + 1, 1)?, &[-2])
         };
-        let norm = |x: &Array, w: &Array| -> Result<Array> {
-            ops::astype(&ops::rms_norm(x, Some(w), self.eps)?, dtype)
+        let norm = |x: &Array, w: &NormWeight| -> Result<Array> {
+            ops::astype(&ops::rms_norm(x, Some(w.for_input(x)), self.eps)?, dtype)
         };
         match &self.input_norms {
             InputNorms::Sliding(w) => {
@@ -988,7 +1110,8 @@ impl Layer {
                         [norm(&a, w)?, norm(&b, w)?, norm(&c, w)?]
                     }
                 };
-                self.attn.forward(kern, &q, &k, &v, cache)
+                self.attn
+                    .forward(kern, &q, &k, &v, messages.is_none(), cache)
             }
             InputNorms::Full {
                 q: wq,
@@ -1002,8 +1125,14 @@ impl Layer {
                 if let Some(m) = messages {
                     [q, k, v] = self.mix_messages(kern, &q, &k, &v, m)?;
                 }
-                self.attn
-                    .forward(kern, &norm(&q, wq)?, &norm(&k, wk)?, &norm(&v, wv)?, cache)
+                self.attn.forward(
+                    kern,
+                    &norm(&q, wq)?,
+                    &norm(&k, wk)?,
+                    &norm(&v, wv)?,
+                    false,
+                    cache,
+                )
             }
         }
     }
@@ -1033,9 +1162,13 @@ impl Layer {
         let h = self.self_attention(kern, hidden, attention_inputs.as_ref(), cache, messages);
         cache.verifying = false;
         let h = h?;
-        let (h, w2) = self
-            .post_attention_convolution
-            .forward(kern, &h, cache.conv[2].as_ref())?;
+        let (h, w2) = self.post_attention_convolution.forward(
+            kern,
+            &h,
+            cache.conv[2].as_ref(),
+            true,
+            keep_windows,
+        )?;
         cache.conv[2] = Some(w2);
 
         let mut h = ops::f32(&h)?;
@@ -1073,13 +1206,21 @@ impl Layer {
             )?;
         }
         let h = ops::astype(
-            &ops::rms_norm(&h, Some(&self.post_attention_layernorm), self.eps)?,
+            &ops::rms_norm(
+                &h,
+                Some(self.post_attention_layernorm.for_input(&h)),
+                self.eps,
+            )?,
             dtype,
         )?;
         let h = self.moe.forward(kern, &h)?;
-        let (h, w3) = self
-            .post_mlp_convolution
-            .forward(kern, &h, cache.conv[3].as_ref())?;
+        let (h, w3) = self.post_mlp_convolution.forward(
+            kern,
+            &h,
+            cache.conv[3].as_ref(),
+            true,
+            keep_windows,
+        )?;
         cache.conv[3] = Some(w3);
 
         let n = self.post_mlp_convolution.kernel_size - 1;
@@ -1104,9 +1245,9 @@ impl Layer {
         let a = &self.attn;
         let mut v = vec![
             &self.mlp_input,
-            &self.post_attention_layernorm,
             &self.post_attention_convolution.weight,
             &self.post_mlp_convolution.weight,
+            &a.merged,
             &a.q_proj,
             &a.k_proj,
             &a.v_proj,
@@ -1121,9 +1262,14 @@ impl Layer {
             &self.moe.bias,
         ];
         v.extend(self.attention_input.iter());
+        v.extend(self.post_attention_layernorm.arrays());
         match &self.input_norms {
-            InputNorms::Sliding(w) => v.push(w),
-            InputNorms::Full { q, k, v: vv } => v.extend([q, k, vv]),
+            InputNorms::Sliding(w) => v.extend(w.arrays()),
+            InputNorms::Full { q, k, v: vv } => {
+                v.extend(q.arrays());
+                v.extend(k.arrays());
+                v.extend(vv.arrays());
+            }
         }
         for c in [&a.k_conv, &a.v_conv] {
             match c {

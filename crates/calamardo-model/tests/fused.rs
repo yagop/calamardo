@@ -105,14 +105,10 @@ fn short_conv_step_matches_ops() {
         let state = Array::from_slice(&data((k - 1) * c, 12, 6.0), &[1, (k - 1) as i32, c as i32]);
         let w = bf16(data(c * k, 13, 1.5), &[c as i32, k as i32, 1]);
         let denom = ((k + 1) as f64).sqrt() as f32;
-        let (out, win) = kern
-            .short_conv_step(
-                &x,
-                &state,
-                &ops::reshape(&w, &[c as i32, k as i32]).unwrap(),
-                denom,
-            )
-            .unwrap();
+        let wr = ops::reshape(&w, &[c as i32, k as i32]).unwrap();
+        let (out, next) = kern.short_conv_step(&x, &state, &wr, denom, false).unwrap();
+        let (out32, _) = kern.short_conv_step(&x, &state, &wr, denom, true).unwrap();
+        assert_eq!(out32.dtype(), Dtype::Float32);
         // ShortConvolution::forward, op by op.
         let residual = ops::f32(&x).unwrap();
         let window = ops::concatenate(&[&state, &ops::f32(&x).unwrap()], 1).unwrap();
@@ -126,7 +122,9 @@ fn short_conv_step_matches_ops() {
         let want = ops::div(&want, &ops::f32s(denom)).unwrap();
         let want = ops::astype(&want, Dtype::Bfloat16).unwrap();
         assert_eq!(bits(&out), bits(&want), "C {c} K {k}: output");
-        assert_eq!(bits(&win), bits(&window), "C {c} K {k}: window");
+        assert_eq!(bits(&out32), bits(&want), "C {c} K {k}: float32 output");
+        let want_next = ops::slice(&window, 1, 1, k as i32, 1).unwrap();
+        assert_eq!(bits(&next), bits(&want_next), "C {c} K {k}: next state");
     }
 }
 
@@ -159,4 +157,41 @@ fn conv_state_does_not_keep_the_window() {
         "the window stayed alive ({with} -> {without})"
     );
     assert_eq!(state.shape(), &[1, 3, 2304]);
+}
+
+/// One decode gemv over concatenated weights gives each part's rows bit for
+/// bit as its own gemv (MLX picks the same reduction for these sizes).
+#[test]
+fn merged_projection_matches_separate() {
+    ops::init();
+    // q, r, gate, k, v of a pass (rows), all over the 2304-wide input.
+    let rows = [3072, 384, 3072, 1024, 1024];
+    let k = 2304;
+    let ws: Vec<Array> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| bf16(data(n * k, 30 + i as u32, 0.2), &[n as i32, k as i32]))
+        .collect();
+    let merged = ops::concatenate(&ws.iter().collect::<Vec<_>>(), 0).unwrap();
+    for (seed, amp) in [(41, 2.0), (42, 40.0)] {
+        let x = bf16(data(k, seed, amp), &[1, 1, k as i32]);
+        let all = ops::linear(&x, &merged).unwrap();
+        let qrg = ops::linear(&x, &ops::slice(&merged, 0, 0, 6528, 1).unwrap()).unwrap();
+        let mut start = 0;
+        for (w, &n) in ws.iter().zip(&rows) {
+            let want = bits(&ops::linear(&x, w).unwrap());
+            let part = ops::slice(&all, -1, start, start + n as i32, 1).unwrap();
+            assert_eq!(
+                bits(&part),
+                want,
+                "rows {start}..{} of the 5-way merge",
+                start + n as i32
+            );
+            if start < 6528 {
+                let part = ops::slice(&qrg, -1, start, start + n as i32, 1).unwrap();
+                assert_eq!(bits(&part), want, "rows {start}.. of q/r/gate");
+            }
+            start += n as i32;
+        }
+    }
 }

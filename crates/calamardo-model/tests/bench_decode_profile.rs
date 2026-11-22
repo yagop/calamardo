@@ -688,3 +688,33 @@ fn compile_small_blocks() {
         },
     );
 }
+
+/// Captures one decode step (1k context, bf16 cache) as a Metal GPU trace
+/// for offline profiling (e.g. `gputrace report`). Needs
+/// `MTL_CAPTURE_ENABLED=1`; writes `PROFILE_DIR/decode_step.gputrace`.
+#[test]
+#[ignore]
+fn capture_decode_step() {
+    let model = load();
+    let mut cache = prefilled(&model, KvFormat::BF16, 1024);
+    for t in 0..4 {
+        timed_step(&model, &mut cache, 3000 + t);
+    }
+    let path = scratch().join("decode_step.gputrace");
+    let _ = std::fs::remove_dir_all(&path);
+    let c = CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: plain MLX-C calls; the path outlives them.
+    assert_eq!(
+        unsafe { sys::mlx_metal_start_capture(c.as_ptr()) },
+        0,
+        "start capture"
+    );
+    let logits = model
+        .forward(&Array::from_slice(&[3100], &[1, 1]), &mut cache)
+        .unwrap();
+    let mut live = vec![&logits];
+    live.extend(cache.iter().flat_map(|c| c.arrays()));
+    ops::eval(&live).unwrap();
+    assert_eq!(unsafe { sys::mlx_metal_stop_capture() }, 0, "stop capture");
+    println!("captured {}", path.display());
+}
