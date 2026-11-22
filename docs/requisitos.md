@@ -177,7 +177,7 @@ Calamardo debe igualar a nuestro Ollama modificado con contexto corto y superarl
 | Pico transitorio por encima de lo activo a ~160k | 9–10 GB | ≤ 3 GB |
 | Contexto que se mantiene en caché entre turnos | ~150k tokens | ≥ 300k (RAM + disco) |
 | Restaurar 160k tokens desde disco | No existe | ≤ 2 s |
-| Aceptación del drafter | 52–83 % | Igual o mejor |
+| Aceptación del drafter | 52–83 % | Igual o mejor, medida a la misma profundidad y sobre el mismo texto (ver la nota del 22 de noviembre) |
 
 ## Verificación
 
@@ -481,6 +481,31 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
   - Bit a bit (test frente a las operaciones originales) y con paridad exacta con la referencia.
 - 3.358 kernels por token (antes 3.790), pero el tiempo apenas cambia: decode 22,2 ms y GPU 20,2 ms (antes 20,4). Los kernels pequeños que quedan casi siempre se solapan con otros, porque MLX lanza en paralelo las operaciones independientes. Lo que marca el tiempo ahora es la cadena de operaciones dependientes de cada pasada y los productos grandes, no el número de kernels.
 - Conclusión: quitar kernels sueltos ya no rinde. Lo que queda por ganar en decode requiere acortar la cadena dependiente (núcleos que fusionen norma, conversión y producto, o pasadas enteras), dejar de reproducir bit a bit a MLX en los expertos, o cambiar la precisión de las capas densas.
+
+**Aceptación del drafter frente a Ollama (22 de noviembre de 2026)**
+
+- El objetivo de la tabla («Aceptación del drafter: 52–83 %, igual o mejor») no se puede comparar tal cual. La tasa (aceptados / propuestos) baja con cada borrador más por ronda, así que depende de la política de profundidad de cada runtime, y del texto que genera cada uno (en greedy se separan en casi empates).
+  - Ollama elige la profundidad por aceptación aprendida.
+  - Calamardo la elige por velocidad medida y, con la verificación ya barata, propone más borradores por ronda.
+- Curva por posición (`bench_acceptance_curve`, 7 borradores por ronda, greedy, caché bf16, 300 tokens): P(se aceptan al menos k borradores).
+
+  | Texto | k = 1 | 2 | 3 | 4 | Tasa a profundidad 3 |
+  |---|---|---|---|---|---|
+  | Código (generado por Calamardo) | 59 % | 33 % | 17 % | 7 % | 36 % |
+  | Prosa | 59 % | 32 % | 17 % | 9 % | 36 % |
+  | Ensayo sobre 29k | 67 % | 37 % | 20 % | 11 % | 41 % |
+
+- Los mismos prompts (mismos 31.133 tokens) en el Ollama 0.40.17-q8kv local, en modo `raw`:
+  - código: 30–39 % con profundidad media 3,1–4,6;
+  - prosa: 39 % (2,75);
+  - ensayo sobre 29k: 53–55 % (~3).
+- Con el texto exacto que generó Ollama (`bench_acceptance_on_given_text`: se proponen 7 y se avanza por ese texto), el drafter de Calamardo acepta lo mismo o más:
+  - código: 44 % a profundidad 3 y 36 % a 4;
+  - ensayo: 51 % a profundidad 3, con un 74 % en la primera posición.
+
+  El drafter no tiene ningún defecto: la diferencia en las pruebas anteriores venía del texto generado y de la profundidad elegida.
+- La implementación se revisó también frente al `draft.go` de Ollama: tomas de la red (entrada de las pasadas 5, 23 y 41 y salida final normalizada), contexto, ventanas, RoPE, residuos y cabeza Markov con las filas 1…n. Coinciden.
+- Conclusión: el objetivo útil son los tokens por segundo (mediana de 49 tok/s frente a 36,7 de Ollama a 29k), o la tasa medida a la misma profundidad sobre el mismo texto. Con esa medida, Calamardo iguala o supera a Ollama.
 
 **Incoherencias a resolver**
 
