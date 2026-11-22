@@ -816,6 +816,16 @@ impl Kernels {
         let sinks = ops::contiguous(&ops::f32(sinks)?)?;
         let key_start = ops::contiguous(&ops::broadcast_to(&ops::i32s(0), &[b])?)?;
         let sizes = Array::from_slice(&[l, len, cap], &[3]);
+        // The kernel indexes the buffers as dense rows (a sliced view, e.g.
+        // after a fork, is copied first; fresh buffers are left as they are).
+        let dense = |p: &crate::cache::Packed| -> Result<crate::cache::Packed> {
+            Ok(crate::cache::Packed {
+                w: ops::contiguous(&p.w)?,
+                scales: ops::contiguous(&p.scales)?,
+                biases: ops::contiguous(&p.biases)?,
+            })
+        };
+        let (keys, values) = (&dense(keys)?, &dense(values)?);
         let scale = f32s(scale);
         // SAFETY: the launch shapes match the kernel's indexing, as in the
         // bf16 kernel; the packed buffers hold `cap` rows per KV head.

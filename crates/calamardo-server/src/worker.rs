@@ -391,12 +391,16 @@ pub fn spawn(
         .name("calamardo-model".into())
         .spawn(move || {
             let loaded = Model::load(&config.model_dir).and_then(|m| {
-                let drafter =
-                    if config.speculative && config.model_dir.join("mtp.safetensors").exists() {
-                        Some(Drafter::load(&config.model_dir, &m)?)
-                    } else {
-                        None
-                    };
+                // Drafting decides by measured speed, so its output is not
+                // reproducible: off when bit-exact output is asked for.
+                let drafter = if config.speculative
+                    && !config.aligned_prefix
+                    && config.model_dir.join("mtp.safetensors").exists()
+                {
+                    Some(Drafter::load(&config.model_dir, &m)?)
+                } else {
+                    None
+                };
                 Ok((m, drafter))
             });
             let (model, drafter) = match loaded {
@@ -422,7 +426,6 @@ pub fn spawn(
                 ("model".to_string(), config.model_id.clone()),
                 ("kv_bits".to_string(), config.kv.bits.to_string()),
                 ("kv_group".to_string(), config.kv.group_size.to_string()),
-                ("draft".to_string(), drafter.is_some().to_string()),
             ]
             .into_iter()
             .collect();
@@ -447,12 +450,23 @@ pub fn spawn(
                 aligned: config.aligned_prefix,
             };
             cache.prewarm();
+            // One policy for the server: it learns block sizes across requests.
+            let mut policy = drafter
+                .as_ref()
+                .map(|d| DraftPolicy::new(config.draft_block.min(d.block_size)));
             while let Some(job) = queue.pop() {
                 metrics.set_queue(queue.len());
                 queue.set_current(Some(job.cancel.clone()));
                 let (mut session, cached) = cache.take(&job.prompt);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(&mut session, cached, &config, &job, &metrics)
+                    run(
+                        &mut session,
+                        cached,
+                        &config,
+                        &job,
+                        &metrics,
+                        policy.as_mut(),
+                    )
                 }));
                 queue.set_current(None);
                 match result {
@@ -501,6 +515,7 @@ fn run(
     config: &WorkerConfig,
     job: &Job,
     metrics: &Metrics,
+    mut policy: Option<&mut DraftPolicy>,
 ) -> Result<()> {
     let send = |e: Event| {
         if job.events.send(e).is_err() {
@@ -521,9 +536,10 @@ fn run(
     metrics.prefill_done(job.prompt.len() - cached, t.elapsed().as_secs_f64());
 
     let mut sampler = Sampler::new(job.temperature, job.top_p, job.seed);
-    let mut policy = session
-        .has_drafter()
-        .then(|| DraftPolicy::new(config.draft_block));
+    if !session.has_drafter() {
+        policy = None;
+    }
+    let mut cleared = 0;
     let t = Instant::now();
     let stop = &config.stop_tokens;
     let mut last = sampler.sample(&lp)?;
@@ -540,15 +556,13 @@ fn run(
             break Finish::Cancelled;
         }
         // At most as many tokens as are still allowed.
-        let block = policy
-            .as_mut()
-            .map_or(1, |p| p.next(job.max_tokens - n - 1));
+        let block = policy.as_mut().map_or(1, |p| p.next(job.max_tokens - n));
         let step = Instant::now();
         if block >= 2 {
             let r = session.speculate(last, block, &mut sampler, stop)?;
-            let p = policy.as_mut().unwrap();
-            p.record(r.accepted, r.drafted);
-            p.record_time(r.tokens.len(), step.elapsed().as_secs_f64(), true);
+            if let Some(p) = policy.as_mut() {
+                p.record(block, r.tokens.len(), step.elapsed().as_secs_f64());
+            }
             metrics.draft(r.accepted, r.drafted);
             for &tok in &r.tokens {
                 n += 1;
@@ -562,13 +576,14 @@ fn run(
             let lp = session.feed(&[last], &job.cancel, &mut |_| {})?;
             last = sampler.sample(&lp)?;
             if let Some(p) = policy.as_mut() {
-                p.record_time(1, step.elapsed().as_secs_f64(), false);
+                p.record(1, 1, step.elapsed().as_secs_f64());
             }
             n += 1;
             send(Event::Token(last));
         }
-        if n % 256 < 8 {
-            // As mlx-lm's generate_step, roughly every 256 tokens.
+        if n / 256 > cleared {
+            // As mlx-lm's generate_step, every 256 tokens.
+            cleared = n / 256;
             calamardo_model::ops::clear_cache();
         }
     };

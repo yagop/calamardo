@@ -426,6 +426,7 @@ impl Attention {
         let q = ops::transpose(&q, &[0, 2, 1, 3])?;
         let k = ops::transpose(&k, &[0, 2, 1, 3])?;
         let v = ops::transpose(&v, &[0, 2, 1, 3])?;
+        let verifying = cache.verifying;
         let out = match &mut cache.attn {
             AttnCache::Quantized(c) => {
                 c.update(&k, &v)?;
@@ -457,7 +458,9 @@ impl Attention {
                     )?
                 }
             }
-            AttnCache::Global(c) if (2..=MAX_DECODE_QUERIES).contains(&l) => {
+            // Only for verification: prefill chunks of a few tokens keep the
+            // reference's kernel (exact parity).
+            AttnCache::Global(c) if verifying && (2..=MAX_DECODE_QUERIES).contains(&l) => {
                 // Speculative verification: the decode kernel over the bf16
                 // cache in place (the prefill kernel has too few threadgroups
                 // for a handful of queries over a long context).
@@ -876,7 +879,10 @@ impl Layer {
             }
             None => None,
         };
-        let h = self.self_attention(kern, hidden, attention_inputs.as_ref(), cache, messages)?;
+        cache.verifying = keep_windows;
+        let h = self.self_attention(kern, hidden, attention_inputs.as_ref(), cache, messages);
+        cache.verifying = false;
+        let h = h?;
         let (h, w2) = self
             .post_attention_convolution
             .forward(&h, cache.conv[2].as_ref())?;
@@ -1120,6 +1126,7 @@ impl Model {
                 },
                 conv: [None, None, None, None],
                 windows: None,
+                verifying: false,
             })
             .collect()
     }

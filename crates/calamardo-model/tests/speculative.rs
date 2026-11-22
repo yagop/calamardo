@@ -11,7 +11,7 @@ use calamardo_model::{
     Model,
     cache::KvFormat,
     draft::Drafter,
-    generate::{DraftPolicy, Sampler, Session},
+    generate::{Sampler, Session},
     ops,
 };
 
@@ -25,11 +25,24 @@ fn speculative_matches_greedy_up_to_ties() {
     let drafter = Drafter::load(&dir, &model).unwrap();
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
     let text = "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>List the planets of the solar system with one fact each.<|end_message|>";
-    let prompt = tok.encode(text, false).unwrap().get_ids().to_vec();
+    let long = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/prompts/needle-8k.txt"
+    ))
+    .unwrap();
     let no = AtomicBool::new(false);
     let n = 200;
 
-    for kv in [KvFormat::BF16, KvFormat::new(8, 64).unwrap()] {
+    // Short (windows not full) and 8k tokens (full, trimmed windows), with
+    // bf16, 8- and 4-bit caches.
+    let cases = [
+        (text.to_string(), KvFormat::BF16),
+        (text.to_string(), KvFormat::new(8, 64).unwrap()),
+        (long.clone(), KvFormat::BF16),
+        (long, KvFormat::new(4, 64).unwrap()),
+    ];
+    for (text, kv) in cases {
+        let prompt = tok.encode(text.as_str(), false).unwrap().get_ids().to_vec();
         // Plain greedy, keeping the gap between the two best tokens.
         let mut s = Session::new(&model, kv);
         let mut lp = s.feed(&prompt, &no, &mut |_| {}).unwrap();
@@ -54,19 +67,17 @@ fn speculative_matches_greedy_up_to_ties() {
         let mut s = Session::new(&model, kv).with_drafter(&drafter);
         let lp = s.feed(&prompt, &no, &mut |_| {}).unwrap();
         let mut sampler = Sampler::new(0.0, 1.0, 0);
-        let mut policy = DraftPolicy::new(drafter.block_size);
-        // Acceptance only: no timing, so the policy keeps drafting.
         let mut spec = vec![sampler.sample(&lp).unwrap()];
         let (mut drafted, mut accepted) = (0, 0);
         while spec.len() < n {
-            let block = policy.next(n - spec.len() - 1);
+            // A fixed block: the test must not depend on timing.
+            let block = 4.min(n - spec.len());
             if block < 2 {
                 break;
             }
             let r = s
                 .speculate(*spec.last().unwrap(), block, &mut sampler, &[])
                 .unwrap();
-            policy.record(r.accepted, r.drafted);
             drafted += r.drafted;
             accepted += r.accepted;
             spec.extend(r.tokens);
@@ -80,7 +91,8 @@ fn speculative_matches_greedy_up_to_ties() {
 
         let first = greedy.iter().zip(&spec).position(|(a, b)| a != b);
         eprintln!(
-            "{kv:?}: acceptance {:.0}% ({accepted}/{drafted}), first difference at {first:?}{}",
+            "{} tokens, {kv:?}: acceptance {:.0}% ({accepted}/{drafted}), first difference at {first:?}{}",
+            prompt.len(),
             100.0 * accepted as f64 / drafted as f64,
             first.map_or(String::new(), |i| format!(" (gap {:.3} nats)", gaps[i]))
         );

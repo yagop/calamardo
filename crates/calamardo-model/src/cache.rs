@@ -455,6 +455,9 @@ pub struct PassCache {
     /// Convolution windows (state + inputs) of the last speculative
     /// verification, to rewind `conv` to an accepted token.
     pub windows: Option<[Array; 4]>,
+    /// The current forward is a speculative verification (set and cleared
+    /// by the layer around its attention).
+    pub verifying: bool,
 }
 
 impl PassCache {
@@ -735,7 +738,12 @@ impl PassCache {
             AttnCache::Quantized(c) => c.truncate(c.offset - drop),
             AttnCache::Window(c) => c.drop_last(drop)?,
         }
-        if let Some(windows) = self.windows.take()
+        let windows = self.windows.take();
+        anyhow::ensure!(
+            drop == 0 || windows.is_some(),
+            "rewind without the verification's windows"
+        );
+        if let Some(windows) = windows
             && drop > 0
         {
             for (state, window) in self.conv.iter_mut().zip(windows.iter()) {

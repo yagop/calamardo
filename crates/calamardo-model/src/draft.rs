@@ -140,20 +140,27 @@ impl Drafter {
         }
         let hidden_out = take("markov_head.hidden_out.weight")?;
         let hidden_out_b = take("markov_head.hidden_out.bias")?;
-        // The reference folds in float64 on the CPU; float32 on the GPU gives
-        // the same bf16 values but for rare ties of the last rounding.
-        let head = ops::f32(target.lm_head())?;
-        let fold_w = ops::astype(
-            &ops::matmul(&head, &ops::f32(&hidden_out)?)?,
-            hidden_out.dtype(),
-        )?;
-        let fold_b = ops::astype(
-            &ops::squeeze(
-                &ops::matmul(&head, &ops::reshape(&ops::f32(&hidden_out_b)?, &[-1, 1])?)?,
-                &[1],
-            )?,
-            hidden_out.dtype(),
-        )?;
+        // The reference folds in float64 on the CPU, in tiles of 4096 rows;
+        // float32 on the GPU gives the same bf16 values but for rare ties of
+        // the last rounding. Tiles keep the transient small.
+        let head = target.lm_head();
+        let proj = ops::f32(&hidden_out)?;
+        let bias = ops::reshape(&ops::f32(&hidden_out_b)?, &[-1, 1])?;
+        let (mut ws, mut bs) = (Vec::new(), Vec::new());
+        let rows = head.shape()[0];
+        for start in (0..rows).step_by(4096) {
+            let tile = ops::f32(&ops::slice(head, 0, start, (start + 4096).min(rows), 1)?)?;
+            let w = ops::astype(&ops::matmul(&tile, &proj)?, hidden_out.dtype())?;
+            let b = ops::astype(
+                &ops::squeeze(&ops::matmul(&tile, &bias)?, &[1])?,
+                hidden_out.dtype(),
+            )?;
+            ops::eval(&[&w, &b])?;
+            ws.push(w);
+            bs.push(b);
+        }
+        let fold_w = ops::concatenate(&ws.iter().collect::<Vec<_>>(), 0)?;
+        let fold_b = ops::concatenate(&bs.iter().collect::<Vec<_>>(), 0)?;
         let fuse = take("fuse_weight")?;
         let alpha = ops::astype(
             &ops::softmax(&ops::f32(&fuse)?, &[-1], false)?,

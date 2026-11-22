@@ -287,6 +287,11 @@ impl<'m> Session<'m> {
         self.drafter.is_some()
     }
 
+    /// The drafter's context, if speculation is enabled.
+    pub fn draft_state(&self) -> Option<&DraftState> {
+        self.draft.as_ref()
+    }
+
     fn take_snapshot(&mut self, prompt_end: bool) {
         if let Some(last) = self.snapshots.last_mut()
             && last.len == self.tokens.len()
@@ -541,94 +546,104 @@ impl<'m> Session<'m> {
     }
 }
 
-/// Picks how many tokens to draft next from recent acceptance (M-7): the
-/// policy mlx-vlm uses for DFlash drafters, within the trained block.
+/// Picks the block size (anchor plus drafts) of the next speculative round
+/// by measured speed (M-7): a block of 1 is plain decoding. Each size keeps a
+/// window of recent (tokens, seconds); the first sample of each is dropped
+/// (kernels compile on first use). The current size changes only for one at
+/// least 5% faster, and every size is probed now and then, as the best one
+/// moves with the context length and the text.
 pub struct DraftPolicy {
-    history: std::collections::VecDeque<(usize, usize)>,
-    ceiling: usize,
-    /// Measured speeds (tokens per second, smoothed) with and without
-    /// drafting: drafting stops when it does not pay (long contexts, where
-    /// verifying a block costs more), probing again now and then.
-    spec_tps: Option<f64>,
-    plain_tps: Option<f64>,
+    sizes: Vec<usize>,
+    samples: Vec<std::collections::VecDeque<(usize, f64)>>,
+    warmed: Vec<bool>,
+    current: usize,
     decisions: usize,
 }
 
 impl DraftPolicy {
-    /// Shortest block the policy backs off to.
-    const MIN_BLOCK: usize = 4;
+    const WINDOW: usize = 8;
+    const PROBE_EVERY: usize = 12;
+    const MARGIN: f64 = 1.05;
 
-    pub fn new(block_size: usize) -> Self {
+    /// `ceiling`: the largest block (the drafter's trained block at most).
+    pub fn new(ceiling: usize) -> Self {
+        let mut sizes: Vec<usize> = [1, 2, 4, 6, 8]
+            .into_iter()
+            .filter(|&b| b <= ceiling.max(1))
+            .collect();
+        if !sizes.contains(&ceiling) && ceiling > 1 {
+            sizes.push(ceiling);
+        }
+        let n = sizes.len();
         Self {
-            history: Default::default(),
-            ceiling: block_size,
-            spec_tps: None,
-            plain_tps: None,
+            sizes,
+            samples: vec![Default::default(); n],
+            warmed: vec![false; n],
+            current: 0,
             decisions: 0,
         }
     }
 
-    /// Every this many decisions the slower mode is tried again.
-    const PROBE_EVERY: usize = 16;
-
-    /// Time of one round (speculative) or one plain step.
-    pub fn record_time(&mut self, tokens: usize, seconds: f64, speculative: bool) {
-        let tps = tokens as f64 / seconds.max(1e-6);
-        let slot = if speculative {
-            &mut self.spec_tps
-        } else {
-            &mut self.plain_tps
-        };
-        *slot = Some(slot.map_or(tps, |old| 0.7 * old + 0.3 * tps));
+    fn rate(&self, i: usize) -> Option<f64> {
+        let w = &self.samples[i];
+        if w.len() < 2 {
+            return None;
+        }
+        let (t, s) = w
+            .iter()
+            .fold((0usize, 0.0), |(t, s), (a, b)| (t + a, s + b));
+        Some(t as f64 / s.max(1e-9))
     }
 
-    pub fn record(&mut self, accepted: usize, drafted: usize) {
-        self.history.push_back((accepted, drafted));
-        if self.history.len() > 8 {
-            self.history.pop_front();
+    /// Records a round of `block` (1 = a plain step) that produced `tokens`.
+    pub fn record(&mut self, block: usize, tokens: usize, seconds: f64) {
+        let Some(i) = self.sizes.iter().position(|&b| b == block) else {
+            return;
+        };
+        if !std::mem::replace(&mut self.warmed[i], true) {
+            return;
+        }
+        self.samples[i].push_back((tokens, seconds));
+        if self.samples[i].len() > Self::WINDOW {
+            self.samples[i].pop_front();
         }
     }
 
-    /// Block size (anchor plus drafts) for the next round, given the tokens
-    /// still allowed. 1 means: decode without drafting.
+    /// Block for the next round, given the tokens still allowed: the block
+    /// never yields more than that.
     pub fn next(&mut self, remaining: usize) -> usize {
-        let total = self.ceiling.min(remaining + 1);
-        if total <= 1 {
-            return total;
+        let cap = remaining.max(1);
+        let allowed: Vec<usize> = (0..self.sizes.len())
+            .filter(|&i| self.sizes[i] <= cap)
+            .collect();
+        if allowed.len() <= 1 {
+            return 1;
         }
         self.decisions += 1;
-        let probe = self.decisions.is_multiple_of(Self::PROBE_EVERY);
-        match (self.spec_tps, self.plain_tps) {
-            // Measure plain decoding once drafting has a few rounds.
-            (Some(_), None) if self.decisions >= 4 => return 1,
-            (Some(s), Some(p)) if s < p && !probe => return 1,
-            _ => {}
+        if let Some(&i) = allowed.iter().find(|&&i| self.rate(i).is_none()) {
+            return self.sizes[i];
         }
-        let recent: Vec<_> = self.history.iter().filter(|(_, d)| *d > 0).collect();
-        let Some(&&(_, last_drafted)) = recent.last() else {
-            return total;
+        if self.decisions.is_multiple_of(Self::PROBE_EVERY) {
+            let i = allowed[(self.decisions / Self::PROBE_EVERY) % allowed.len()];
+            return self.sizes[i];
+        }
+        let best = *allowed
+            .iter()
+            .max_by(|&&a, &&b| self.rate(a).unwrap().total_cmp(&self.rate(b).unwrap()))
+            .unwrap();
+        let current_rate = if allowed.contains(&self.current) {
+            self.rate(self.current).unwrap()
+        } else {
+            0.0
         };
-        let current = total.min((last_drafted + 1).max(2));
-        let min_total = total.min(Self::MIN_BLOCK.max(2));
-        let drafted: usize = recent.iter().map(|(_, d)| d).sum();
-        let accepted: usize = recent.iter().map(|(a, _)| a).sum();
-        let rate = accepted as f64 / drafted as f64;
-        let mean = accepted as f64 / recent.len() as f64;
-        if rate < 0.30 || mean < 2.0 {
-            return if current >= 8 {
-                min_total.max(total.min(current / 2))
-            } else {
-                min_total.max(total.min(current.saturating_sub(2)))
-            };
+        if self.rate(best).unwrap() > current_rate * Self::MARGIN {
+            self.current = best;
         }
-        if rate < 0.50 {
-            return min_total.max(total.min(current.saturating_sub(2)));
-        }
-        let full = recent.iter().filter(|(a, d)| a >= d).count() as f64 / recent.len() as f64;
-        if rate >= 0.85 && full >= 0.75 {
-            return total.min(current + 2);
-        }
-        current
+        self.sizes[if allowed.contains(&self.current) {
+            self.current
+        } else {
+            best
+        }]
     }
 }
 
@@ -874,7 +889,12 @@ impl<'m> Session<'m> {
             meta,
         };
         let mut s = Session::new(model, kv);
-        if let Some(d) = drafter {
+        // A file saved without drafter state loads without speculation (it
+        // would have no context to draft from); drafter state in a file is
+        // ignored when the drafter is off.
+        if let Some(d) = drafter
+            && l.meta.contains_key("draft.len")
+        {
             s = s.with_drafter(d);
         }
         let tokens = l.array("tokens")?;
@@ -901,7 +921,10 @@ impl<'m> Session<'m> {
                 .map(|(i, c)| PassSnapshot::import(c, &format!("snap.{i}"), &mut l))
                 .collect::<Result<Vec<_>>>()?;
             let draft = match &s.draft {
-                Some(d) => Some(DraftSnapshot::import(d, "snap.draft", &mut l)?),
+                Some(d) if l.meta.contains_key("snap.draft.len") => {
+                    Some(DraftSnapshot::import(d, "snap.draft", &mut l)?)
+                }
+                Some(_) => anyhow::bail!("snapshot without drafter state"),
                 None => None,
             };
             s.snapshots.push(Snapshot {
