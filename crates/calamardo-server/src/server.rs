@@ -86,6 +86,8 @@ pub(crate) struct App {
     pub(crate) worker: std::thread::JoinHandle<()>,
     /// When the server started, for Ollama's `/api/ps`.
     pub(crate) started: SystemTime,
+    /// Tokens of context the model supports (prompt plus generation).
+    pub(crate) max_context: usize,
 }
 
 /// Browser clients on this machine only, as Ollama allows by default.
@@ -115,6 +117,12 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let eos = config["eos_token_id"]
         .as_u64()
         .context("config.json has no eos_token_id")? as u32;
+    // The model's context: prompt and generated tokens together.
+    let max_context = config
+        .pointer("/text_config/model_max_length")
+        .and_then(|v| v.as_u64())
+        .context("config.json has no text_config.model_max_length")? as usize;
+    eprintln!("  context            up to {max_context} tokens (the model's limit)");
     let mut stop_tokens = vec![eos];
     for t in [
         "<|endoftext|>",
@@ -159,6 +167,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         metrics,
         worker,
         started: SystemTime::now(),
+        max_context,
     });
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(local_origin))
@@ -598,11 +607,19 @@ pub(crate) async fn drive(
 
 /// Queues the job and waits for the slot.
 pub(crate) async fn start(app: &App, job: &Gen) -> Result<Running, Refused> {
+    if job.prompt.len() >= app.max_context {
+        return Err(Refused::BadRequest(format!(
+            "the prompt has {} tokens; the model's context holds {} with the reply",
+            job.prompt.len(),
+            app.max_context
+        )));
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     let (etx, mut erx) = unbounded_channel();
     let job = Job {
         prompt: job.prompt.clone(),
-        max_tokens: job.max_tokens,
+        // Prompt and reply stay within the model's context.
+        max_tokens: job.max_tokens.min(app.max_context - job.prompt.len()),
         temperature: job.temperature,
         top_p: job.top_p,
         seed: job.seed,

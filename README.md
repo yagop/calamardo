@@ -1,6 +1,6 @@
 # Calamardo
 
-A Rust runtime that serves [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on Apple Silicon Macs, built on [MLX](https://github.com/ml-explore/mlx). It targets very long contexts (512k tokens) for one user on one machine, and speaks the OpenAI, Anthropic and Ollama APIs.
+A Rust runtime that serves [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on Apple Silicon Macs, built on [MLX](https://github.com/ml-explore/mlx).
 
 - **Long contexts without memory spikes:** chunked prefill with a bounded transient (under 3 GB above active memory at 516k tokens), a 4-, 8- or 16-bit global KV cache, and bf16 sliding windows.
 - **Prefix cache in RAM and on disk:** each turn only processes what is new. A 516k-token conversation is saved in 4 s and restored in 2 s.
@@ -23,7 +23,7 @@ At 516k tokens of context with an 8-bit cache, decode runs at 20.8 tok/s with th
 
 ## Requirements
 
-- An Apple Silicon Mac with macOS 26 or later. Development and measurements use an M4 Max with 48 GB; the model takes about 20 GB, and the remaining memory bounds the context.
+- An Apple Silicon Mac with macOS 26 or later. Development and measurements use an M4 Max with 48 GB; the weights take about 20 GB. The model accepts up to 1,048,576 tokens of context, and Calamardo serves prompts up to that length; how much of it fits depends on the memory left after the weights and on the KV cache bits.
 - Rust 1.89 or later (edition 2024).
 - `curl`, `unzip` and `shasum`, to download MLX.
 - Python 3 for `scripts/bench.py` (standard library only). The reference check (`scripts/check-reference.sh`) uses Python 3.12 and creates its own virtual environment.

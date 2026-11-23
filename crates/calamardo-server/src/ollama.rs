@@ -417,7 +417,7 @@ pub(crate) async fn show(State(app): State<Arc<App>>) -> Response {
     Json(json!({
         "modelfile": "", "parameters": "", "template": "",
         "details": details(),
-        "model_info": {"general.architecture": "inkling2", "inkling2.context_length": 1_048_576},
+        "model_info": {"general.architecture": "inkling2", "inkling2.context_length": app.max_context},
         "capabilities": ["completion", "tools", "thinking"],
         "modified_at": rfc3339(app.started),
     }))
@@ -429,7 +429,7 @@ pub(crate) async fn ps(State(app): State<Arc<App>>) -> Response {
     Json(json!({"models": [{
         "name": app.cfg.model_name, "model": app.cfg.model_name, "size": size, "digest": digest(&app),
         "details": details(), "expires_at": "2318-01-01T00:00:00Z", "size_vram": size,
-        "context_length": 1_048_576,
+        "context_length": app.max_context,
     }]}))
     .into_response()
 }
