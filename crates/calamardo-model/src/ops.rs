@@ -865,3 +865,65 @@ impl Drop for Compiled {
         unsafe { sys::mlx_closure_free(self.0) };
     }
 }
+
+/// MLX's version string.
+pub fn mlx_version() -> String {
+    // SAFETY: MLX-C fills a fresh string, read and freed here.
+    unsafe {
+        let mut s = sys::mlx_string_new();
+        let v = if sys::mlx_version(&mut s) == 0 {
+            CStr::from_ptr(sys::mlx_string_data(s))
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "unknown".into()
+        };
+        sys::mlx_string_free(s);
+        v
+    }
+}
+
+/// Properties MLX reports for the GPU (name, architecture, memory sizes),
+/// as key and value strings.
+pub fn gpu_info() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // SAFETY: handles are created and freed here; strings are copied out
+    // while the info object is alive.
+    unsafe {
+        let dev = sys::mlx_device_new_type(sys::mlx_device_type__MLX_GPU, 0);
+        let mut info = sys::mlx_device_info_new();
+        if sys::mlx_device_info_get(&mut info, dev) == 0 {
+            let mut keys = sys::mlx_vector_string_new();
+            if sys::mlx_device_info_get_keys(&mut keys, info) == 0 {
+                for i in 0..sys::mlx_vector_string_size(keys) {
+                    let mut k: *mut c_char = std::ptr::null_mut();
+                    if sys::mlx_vector_string_get(&mut k, keys, i) != 0 || k.is_null() {
+                        continue;
+                    }
+                    let key = CStr::from_ptr(k).to_string_lossy().into_owned();
+                    let ck = CString::new(key.clone()).unwrap_or_default();
+                    let mut is_string = false;
+                    sys::mlx_device_info_is_string(&mut is_string, info, ck.as_ptr());
+                    let value = if is_string {
+                        let mut v: *const c_char = std::ptr::null();
+                        sys::mlx_device_info_get_string(&mut v, info, ck.as_ptr());
+                        if v.is_null() {
+                            continue;
+                        }
+                        CStr::from_ptr(v).to_string_lossy().into_owned()
+                    } else {
+                        let mut v = 0usize;
+                        sys::mlx_device_info_get_size(&mut v, info, ck.as_ptr());
+                        v.to_string()
+                    };
+                    out.push((key, value));
+                }
+            }
+            sys::mlx_vector_string_free(keys);
+        }
+        sys::mlx_device_info_free(info);
+        sys::mlx_device_free(dev);
+    }
+    out.sort();
+    out
+}

@@ -72,8 +72,16 @@ enum Cmd {
         #[arg(long)]
         aligned_prefix: bool,
         /// Directory of the prefix cache on disk.
-        #[arg(long, env = "CALAMARDO_DISK_CACHE_DIR")]
-        disk_cache_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            env = "CALAMARDO_DISK_CACHE_DIR",
+            default_value = "/tmp/calamardo-cache"
+        )]
+        disk_cache_dir: PathBuf,
+        /// Keep the disk cache after exit (and preload the latest
+        /// conversation at the next start); by default it is deleted.
+        #[arg(long, env = "CALAMARDO_KEEP_DISK_CACHE")]
+        keep_disk_cache: bool,
         /// GB of SSD for saved conversations; 0 disables the disk cache.
         #[arg(long, env = "CALAMARDO_DISK_CACHE_GB", default_value_t = 50.0)]
         disk_cache_gb: f64,
@@ -136,6 +144,10 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let model_source = match &cli.model_dir {
+        Some(_) => "local directory".to_string(),
+        None => format!("{}@{}", cli.repo, cli.revision),
+    };
     let dir = match cli.model_dir {
         Some(d) => d,
         None => snapshot_dir(&default_hub_cache()?, &cli.repo, &cli.revision)?,
@@ -156,6 +168,7 @@ fn main() -> Result<()> {
             cache_gb,
             aligned_prefix,
             disk_cache_dir,
+            keep_disk_cache,
             disk_cache_gb,
             no_draft,
             draft_block,
@@ -165,18 +178,11 @@ fn main() -> Result<()> {
                 (2..=8).contains(&draft_block),
                 "--draft-block must be 2 to 8"
             );
-            let disk_cache = if disk_cache_gb > 0.0 {
-                let dir = match disk_cache_dir {
-                    Some(d) => d,
-                    None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                        .join(".cache/calamardo/sessions"),
-                };
-                Some((dir, (disk_cache_gb * 1e9) as u64))
-            } else {
-                None
-            };
+            let disk_cache =
+                (disk_cache_gb > 0.0).then_some((disk_cache_dir, (disk_cache_gb * 1e9) as u64));
             let cfg = calamardo_server::ServerConfig {
                 addr,
+                model_source,
                 model_dir: dir,
                 kv: calamardo_model::cache::KvFormat::new(kv_bits, kv_group)?,
                 prefill_step,
@@ -189,6 +195,7 @@ fn main() -> Result<()> {
                 cache_budget: (cache_gb * 1e9) as usize,
                 aligned_prefix,
                 disk_cache,
+                keep_disk_cache,
                 speculative: !no_draft,
                 draft_block,
             };

@@ -33,7 +33,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::{
     metrics::Metrics,
-    parser::{Delta, ResponseParser, Specials},
+    parser::{Delta, ResponseParser, Specials, TextDecoder},
     template::ChatTemplate,
     worker::{self, Event, Finish, Job, Queue, WorkerConfig},
 };
@@ -44,6 +44,9 @@ const MAX_BODY: usize = 256 << 20;
 pub struct ServerConfig {
     pub addr: SocketAddr,
     pub model_dir: PathBuf,
+    /// Where the model comes from, for the startup report (repository and
+    /// revision, or a directory).
+    pub model_source: String,
     pub kv: KvFormat,
     pub prefill_step: usize,
     /// Name reported by /v1/models. Requests may name any model.
@@ -65,20 +68,24 @@ pub struct ServerConfig {
     pub aligned_prefix: bool,
     /// Prefix cache on disk: directory and byte budget (None disables it).
     pub disk_cache: Option<(PathBuf, u64)>,
+    /// Keep the disk cache across restarts instead of deleting it at exit.
+    pub keep_disk_cache: bool,
     /// Speculative decoding with the DSpark drafter (M-7).
     pub speculative: bool,
     /// Largest draft block (anchor plus drafts).
     pub draft_block: usize,
 }
 
-struct App {
-    cfg: ServerConfig,
-    tokenizer: Tokenizer,
-    template: ChatTemplate,
-    specials: Specials,
-    queue: Arc<Queue>,
-    metrics: Arc<Metrics>,
-    worker: std::thread::JoinHandle<()>,
+pub(crate) struct App {
+    pub(crate) cfg: ServerConfig,
+    pub(crate) tokenizer: Tokenizer,
+    pub(crate) template: ChatTemplate,
+    pub(crate) specials: Specials,
+    pub(crate) queue: Arc<Queue>,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) worker: std::thread::JoinHandle<()>,
+    /// When the server started, for Ollama's `/api/ps`.
+    pub(crate) started: SystemTime,
 }
 
 /// Browser clients on this machine only, as Ollama allows by default.
@@ -99,6 +106,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(cfg.addr)
         .await
         .with_context(|| format!("listening on {}", cfg.addr))?;
+    crate::report::print_startup(&cfg);
     let tokenizer = Tokenizer::from_file(cfg.model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
     let template = ChatTemplate::load(&cfg.model_dir.join("chat_template.jinja"))?;
@@ -129,6 +137,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
             cache_budget: cfg.cache_budget,
             aligned_prefix: cfg.aligned_prefix,
             disk: cfg.disk_cache.clone(),
+            keep_disk_cache: cfg.keep_disk_cache,
             model_id: worker::model_id(&cfg.model_dir),
             speculative: cfg.speculative,
             draft_block: cfg.draft_block,
@@ -140,6 +149,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     ready_rx.await.context("model thread died")??;
 
     let addr = cfg.addr;
+    let keep_disk = cfg.keep_disk_cache;
     let app = Arc::new(App {
         cfg,
         tokenizer,
@@ -148,6 +158,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         queue,
         metrics,
         worker,
+        started: SystemTime::now(),
     });
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(local_origin))
@@ -159,6 +170,19 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         .route("/v1/models", get(models))
         .route("/v1/models/{id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(crate::openai::completions))
+        .route("/v1/responses", post(crate::openai::responses))
+        .route("/v1/messages", post(crate::anthropic::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::anthropic::count_tokens),
+        )
+        .route("/api/chat", post(crate::ollama::chat))
+        .route("/api/generate", post(crate::ollama::generate))
+        .route("/api/tags", get(crate::ollama::tags))
+        .route("/api/show", post(crate::ollama::show))
+        .route("/api/ps", get(crate::ollama::ps))
+        .route("/api/version", get(crate::ollama::version))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(cors)
         .with_state(app.clone());
@@ -170,11 +194,21 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
             shutdown_signal().await;
             // Refuse queued requests and stop the running one at once, so
             // open connections finish quickly; a second signal exits now.
-            eprintln!("shutting down: saving conversations (signal again to exit now)");
+            eprintln!(
+                "shutting down: {} (signal again to exit now)",
+                if keep_disk {
+                    "saving conversations"
+                } else {
+                    "deleting the cache"
+                }
+            );
             closing.close();
-            tokio::spawn(async {
+            tokio::spawn(async move {
                 shutdown_signal().await;
-                eprintln!("exiting without saving");
+                if !keep_disk {
+                    crate::disk::remove_owned();
+                }
+                eprintln!("exiting now");
                 std::process::exit(130);
             });
         })
@@ -203,26 +237,30 @@ async fn shutdown_signal() {
     }
 }
 
-fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     let body = json!({"error": {"message": message.into(), "type": kind}});
     (status, Json(body)).into_response()
 }
 
-fn authorized(app: &App, headers: &HeaderMap) -> bool {
+/// The API key, if one is set: `Authorization: Bearer KEY`, or `x-api-key:
+/// KEY` as Anthropic clients send it.
+pub(crate) fn authorized(app: &App, headers: &HeaderMap) -> bool {
     let Some(key) = &app.cfg.api_key else {
         return true;
     };
-    let Some(v) = headers
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-    else {
-        return false;
+        .and_then(|v| match v.split_once(' ') {
+            // The scheme is case-insensitive (RFC 7235).
+            Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => Some(token.trim()),
+            _ => None,
+        });
+    let given = match bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok())) {
+        Some(g) => g.as_bytes(),
+        None => return false,
     };
-    // The scheme is case-insensitive (RFC 7235); compare in constant time.
-    let given = match v.split_once(' ') {
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim().as_bytes(),
-        _ => return false,
-    };
+    // Constant time.
     let key = key.as_bytes();
     given.len() == key.len() && given.iter().zip(key).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
@@ -246,7 +284,7 @@ async fn metrics_route(State(app): State<Arc<App>>) -> impl IntoResponse {
     )
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -301,7 +339,7 @@ struct Request {
 /// OpenAI messages into what the template expects: `developer` as `system`,
 /// tool call arguments as objects, and `reasoning` (Ollama, newer vLLM) as
 /// `reasoning_content`.
-fn normalize_messages(messages: &Value) -> Result<Vec<Value>, String> {
+pub(crate) fn normalize_messages(messages: &Value) -> Result<Vec<Value>, String> {
     let list = messages.as_array().ok_or("messages must be an array")?;
     let mut out = Vec::with_capacity(list.len());
     for m in list {
@@ -337,7 +375,7 @@ fn normalize_messages(messages: &Value) -> Result<Vec<Value>, String> {
 
 /// `response_format` as an instruction: the output is not constrained, so a
 /// client should still validate it.
-fn format_instruction(body: &Value) -> Option<String> {
+pub(crate) fn format_instruction(body: &Value) -> Option<String> {
     match body
         .pointer("/response_format/type")
         .and_then(|t| t.as_str())?
@@ -358,6 +396,245 @@ fn format_instruction(body: &Value) -> Option<String> {
     }
 }
 
+/// Renders the chat template and tokenizes it.
+pub(crate) fn chat_prompt(
+    app: &App,
+    messages: &Value,
+    tools: Option<&Value>,
+    effort: Option<&Value>,
+) -> Result<Vec<u32>, String> {
+    let text = app
+        .template
+        .render(messages, tools, effort)
+        .map_err(|e| e.to_string())?;
+    raw_prompt(app, &text)
+}
+
+/// Tokenizes text as is (special tokens written in it included).
+pub(crate) fn raw_prompt(app: &App, text: &str) -> Result<Vec<u32>, String> {
+    Ok(app
+        .tokenizer
+        .encode(text, false)
+        .map_err(|e| e.to_string())?
+        .get_ids()
+        .to_vec())
+}
+
+/// The request's reasoning effort, or the server's default.
+pub(crate) fn effort_or_default(app: &App, effort: Option<Value>) -> Option<Value> {
+    effort.or_else(|| app.cfg.default_reasoning_effort.clone().map(Value::String))
+}
+
+/// Stop strings from a JSON string or array (empty ones dropped).
+pub(crate) fn stop_list(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|s| s.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+/// A seed for requests that give none.
+pub(crate) fn random_seed() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        ^ COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What every API asks of the model.
+pub(crate) struct Gen {
+    pub(crate) prompt: Vec<u32>,
+    pub(crate) max_tokens: usize,
+    pub(crate) temperature: f32,
+    pub(crate) top_p: f32,
+    pub(crate) seed: u64,
+}
+
+/// Why a request did not get the model, for each API to report its way.
+pub(crate) enum Refused {
+    Unauthorized,
+    BadRequest(String),
+    /// Queue full or waited too long.
+    Busy(String),
+    Unavailable(String),
+    Internal(String),
+}
+
+impl Refused {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Busy(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Unauthorized => "invalid API key".into(),
+            Self::BadRequest(m) | Self::Busy(m) | Self::Unavailable(m) | Self::Internal(m) => {
+                m.clone()
+            }
+        }
+    }
+
+    /// The OpenAI error shape.
+    pub(crate) fn openai(&self) -> Response {
+        let kind = match self {
+            Self::Unauthorized => "authentication_error",
+            Self::BadRequest(_) => "invalid_request_error",
+            Self::Busy(_) => "rate_limit_error",
+            Self::Unavailable(_) | Self::Internal(_) => "server_error",
+        };
+        error(self.status(), kind, self.message())
+    }
+}
+
+/// The checks every generating route makes before parsing its body.
+pub(crate) fn precheck(app: &App, headers: &HeaderMap) -> Result<(), Refused> {
+    if !authorized(app, headers) {
+        return Err(Refused::Unauthorized);
+    }
+    if app.worker.is_finished() {
+        return Err(Refused::Unavailable(
+            "the model thread is not running".into(),
+        ));
+    }
+    // Cheap check before tokenizing a long prompt for nothing.
+    if app.queue.is_full() {
+        app.metrics.rejected();
+        return Err(Refused::Busy(
+            "the model is busy and the queue is full".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Parses a JSON body (any Content-Type, as Ollama).
+pub(crate) fn json_body(body: &Bytes) -> Result<Value, Refused> {
+    serde_json::from_slice(body).map_err(|e| Refused::BadRequest(format!("invalid JSON: {e}")))
+}
+
+/// Runs `f` (template rendering, tokenizing: CPU work) off the async threads.
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, Refused> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(Refused::BadRequest(e)),
+        Err(e) => Err(Refused::Internal(e.to_string())),
+    }
+}
+
+/// A job that has the model.
+pub(crate) struct Running {
+    pub(crate) events: UnboundedReceiver<Event>,
+    pub(crate) cancel: Arc<AtomicBool>,
+    /// Prompt tokens served from the prefix cache.
+    pub(crate) cached: usize,
+}
+
+/// What a response hears while the job runs.
+pub(crate) enum Item {
+    Delta(Delta),
+    /// A prefill chunk finished: streams write something, so a client that
+    /// left is noticed before the first token.
+    Prefill {
+        done: usize,
+        total: usize,
+    },
+}
+
+/// Runs the job's events through `c` until it ends, handing every delta and
+/// prefill step to `emit`. A stop sequence cancels the job.
+pub(crate) async fn drive(
+    app: &App,
+    run: &mut Running,
+    c: &mut Collector,
+    mut emit: impl FnMut(Item),
+) -> Result<worker::Done, String> {
+    while let Some(ev) = run.events.recv().await {
+        match ev {
+            Event::Prefill(p) => emit(Item::Prefill {
+                done: p.done,
+                total: p.total,
+            }),
+            Event::Token(t) => {
+                for d in c.token(&app.tokenizer, t) {
+                    emit(Item::Delta(d));
+                }
+                if c.stopped {
+                    run.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Event::Done(d) => {
+                for x in c.finish(&app.tokenizer) {
+                    emit(Item::Delta(x));
+                }
+                return Ok(d);
+            }
+            Event::Error(e) => {
+                app.metrics.error();
+                return Err(e);
+            }
+            Event::Started { .. } => {}
+        }
+    }
+    if !run.cancel.load(Ordering::Relaxed) {
+        app.metrics.error();
+    }
+    Err("generation ended unexpectedly".into())
+}
+
+/// Queues the job and waits for the slot.
+pub(crate) async fn start(app: &App, job: &Gen) -> Result<Running, Refused> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (etx, mut erx) = unbounded_channel();
+    let job = Job {
+        prompt: job.prompt.clone(),
+        max_tokens: job.max_tokens,
+        temperature: job.temperature,
+        top_p: job.top_p,
+        seed: job.seed,
+        cancel: cancel.clone(),
+        events: etx,
+    };
+    if app.queue.push(job).is_err() {
+        app.metrics.rejected();
+        return Err(Refused::Busy(
+            "the model is busy and the queue is full".into(),
+        ));
+    }
+    app.metrics.set_queue(app.queue.len());
+    match tokio::time::timeout(app.cfg.max_queue_wait, erx.recv()).await {
+        Ok(Some(Event::Started { cached })) => Ok(Running {
+            events: erx,
+            cancel,
+            cached,
+        }),
+        Ok(Some(Event::Error(e))) => {
+            app.metrics.error();
+            Err(Refused::Internal(e))
+        }
+        Ok(_) => Err(Refused::Internal("the model thread stopped".into())),
+        Err(_) => {
+            cancel.store(true, Ordering::Relaxed);
+            app.metrics.rejected();
+            Err(Refused::Busy("waited too long for the model".into()))
+        }
+    }
+}
+
 fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
     if body.get("logprobs").and_then(|v| v.as_bool()) == Some(true) {
         return Err("logprobs are not supported".into());
@@ -375,42 +652,21 @@ fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
         .get("reasoning_effort")
         .or_else(|| body.pointer("/reasoning/effort"))
         .filter(|v| !v.is_null())
-        .cloned()
-        .or_else(|| app.cfg.default_reasoning_effort.clone().map(Value::String));
-    let text = app
-        .template
-        .render(&messages, tools, effort.as_ref())
-        .map_err(|e| e.to_string())?;
-    let prompt = app
-        .tokenizer
-        .encode(text, false)
-        .map_err(|e| e.to_string())?
-        .get_ids()
-        .to_vec();
+        .cloned();
+    let prompt = chat_prompt(
+        app,
+        &messages,
+        tools,
+        effort_or_default(app, effort).as_ref(),
+    )?;
     let num = |k: &str| body.get(k).and_then(|v| v.as_f64());
     let max_tokens = body
         .get("max_completion_tokens")
         .or_else(|| body.get("max_tokens"))
         .and_then(|v| v.as_f64())
         .map_or(app.cfg.default_max_tokens, |v| v as usize);
-    let stop = match body.get("stop") {
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|s| s.as_str().map(String::from))
-            .collect(),
-        _ => Vec::new(),
-    }
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .collect();
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seed = num("seed").map(|v| v as u64).unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64)
-            ^ COUNTER.fetch_add(1, Ordering::Relaxed)
-    });
+    let stop = stop_list(body.get("stop"));
+    let seed = num("seed").map(|v| v as u64).unwrap_or_else(random_seed);
     Ok(Request {
         model: body
             .get("model")
@@ -434,25 +690,45 @@ fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
     })
 }
 
-/// Turns tokens into OpenAI deltas, applying stop sequences to the content.
-struct Collector {
-    parser: ResponseParser,
+enum Source {
+    /// Chat output, split by the response template.
+    Template(ResponseParser),
+    /// Plain text (raw completions).
+    Raw(TextDecoder),
+}
+
+/// Turns tokens into reasoning, content and tool call deltas, applying stop
+/// sequences to the content.
+pub(crate) struct Collector {
+    source: Source,
     stops: Vec<String>,
-    content: String,
-    reasoning: String,
-    tool_calls: Vec<(String, String)>,
-    stopped: bool,
+    pub(crate) content: String,
+    pub(crate) reasoning: String,
+    pub(crate) tool_calls: Vec<(String, String)>,
+    pub(crate) stopped: bool,
+    /// The stop sequence that ended the content, if one did.
+    pub(crate) matched_stop: Option<String>,
 }
 
 impl Collector {
-    fn new(specials: Specials, stops: Vec<String>) -> Self {
+    pub(crate) fn new(specials: Specials, stops: Vec<String>) -> Self {
+        Self::with_source(Source::Template(ResponseParser::new(specials)), stops)
+    }
+
+    /// Plain text: every token is content.
+    pub(crate) fn raw(stops: Vec<String>) -> Self {
+        Self::with_source(Source::Raw(TextDecoder::default()), stops)
+    }
+
+    fn with_source(source: Source, stops: Vec<String>) -> Self {
         Self {
-            parser: ResponseParser::new(specials),
+            source,
             stops,
             content: String::new(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
             stopped: false,
+            matched_stop: None,
         }
     }
 
@@ -475,10 +751,13 @@ impl Collector {
                             let from = self
                                 .content
                                 .floor_char_boundary(start.saturating_sub(stop.len()));
-                            self.content[from..].find(stop.as_str()).map(|i| i + from)
+                            self.content[from..]
+                                .find(stop.as_str())
+                                .map(|i| (i + from, stop))
                         })
-                        .min();
-                    if let Some(cut) = hit {
+                        .min_by_key(|(i, _)| *i);
+                    if let Some((cut, stop)) = hit {
+                        self.matched_stop = Some(stop.clone());
                         self.content.truncate(cut);
                         self.stopped = true;
                         if cut > start {
@@ -501,17 +780,23 @@ impl Collector {
         out
     }
 
-    fn token(&mut self, t: &Tokenizer, id: u32) -> Vec<Delta> {
-        let d = self.parser.push(t, id);
+    pub(crate) fn token(&mut self, t: &Tokenizer, id: u32) -> Vec<Delta> {
+        let d = match &mut self.source {
+            Source::Template(p) => p.push(t, id),
+            Source::Raw(d) => d.push(t, id).map(Delta::Content).into_iter().collect(),
+        };
         self.accept(d)
     }
 
-    fn finish(&mut self, t: &Tokenizer) -> Vec<Delta> {
-        let d = self.parser.finish(t);
+    pub(crate) fn finish(&mut self, t: &Tokenizer) -> Vec<Delta> {
+        let d = match &mut self.source {
+            Source::Template(p) => p.finish(t),
+            Source::Raw(d) => d.finish(t).map(Delta::Content).into_iter().collect(),
+        };
         self.accept(d)
     }
 
-    fn finish_reason(&self, finish: Finish) -> &'static str {
+    pub(crate) fn finish_reason(&self, finish: Finish) -> &'static str {
         if !self.tool_calls.is_empty() {
             "tool_calls"
         } else if self.stopped || finish == Finish::Stop {
@@ -522,7 +807,7 @@ impl Collector {
     }
 }
 
-fn completion_id() -> String {
+pub(crate) fn completion_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let t = SystemTime::now()
@@ -531,11 +816,11 @@ fn completion_id() -> String {
     format!("chatcmpl-{t:x}{n:x}")
 }
 
-fn tool_call_json(i: usize, id: &str, name: &str, arguments: &str) -> Value {
+pub(crate) fn tool_call_json(i: usize, id: &str, name: &str, arguments: &str) -> Value {
     json!({"index": i, "id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
 }
 
-fn usage(prompt: usize, cached: usize, completion: usize) -> Value {
+pub(crate) fn usage(prompt: usize, cached: usize, completion: usize) -> Value {
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
@@ -549,106 +834,31 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorized(&app, &headers) {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "invalid API key",
-        );
-    }
-    if app.worker.is_finished() {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "the model thread is not running",
-        );
-    }
-    // Cheap check before tokenizing a long prompt for nothing.
-    if app.queue.is_full() {
-        app.metrics.rejected();
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "the model is busy and the queue is full",
-        );
-    }
-    // Any Content-Type, as Ollama; JSON errors in the OpenAI shape.
-    let body: Value = match serde_json::from_slice(&body) {
+    let parsed = async {
+        precheck(&app, &headers)?;
+        let body = json_body(&body)?;
+        let req = {
+            let app = app.clone();
+            blocking(move || parse_request(&app, &body)).await?
+        };
+        let job = Gen {
+            prompt: req.prompt.clone(),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            seed: req.seed,
+        };
+        let run = start(&app, &job).await?;
+        Ok::<_, Refused>((req, run))
+    };
+    let (req, run) = match parsed.await {
         Ok(v) => v,
-        Err(e) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("invalid JSON: {e}"),
-            );
-        }
+        Err(e) => return e.openai(),
     };
-    // Rendering and tokenizing a long prompt is CPU work: off the async threads.
-    let parsed = {
-        let app = app.clone();
-        tokio::task::spawn_blocking(move || parse_request(&app, &body)).await
-    };
-    let req = match parsed {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-        Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                e.to_string(),
-            );
-        }
-    };
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (etx, mut erx) = unbounded_channel();
-    let job = Job {
-        prompt: req.prompt.clone(),
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        seed: req.seed,
-        cancel: cancel.clone(),
-        events: etx,
-    };
-    if app.queue.push(job).is_err() {
-        app.metrics.rejected();
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "the model is busy and the queue is full",
-        );
-    }
-    app.metrics.set_queue(app.queue.len());
-    // Wait for the slot.
-    match tokio::time::timeout(app.cfg.max_queue_wait, erx.recv()).await {
-        Ok(Some(Event::Started { .. })) => {}
-        Ok(Some(Event::Error(e))) => {
-            app.metrics.error();
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e);
-        }
-        Ok(_) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "the model thread stopped",
-            );
-        }
-        Err(_) => {
-            cancel.store(true, Ordering::Relaxed);
-            app.metrics.rejected();
-            return error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                "waited too long for the model",
-            );
-        }
-    }
-
     if req.stream {
-        stream_response(app, req, cancel, erx)
+        stream_response(app, req, run.cancel, run.events)
     } else {
-        full_response(app, req, cancel, erx).await
+        full_response(app, req, run.cancel, run.events).await
     }
 }
 
@@ -671,13 +881,13 @@ async fn full_response(
                     cancel.store(true, Ordering::Relaxed);
                 }
             }
-            Event::Done {
-                finish: f,
-                prompt_tokens: p,
-                cached_tokens: c,
-                completion_tokens: n,
-            } => {
-                (finish, prompt_tokens, cached_tokens, completion_tokens) = (f, p, c, n);
+            Event::Done(d) => {
+                (finish, prompt_tokens, cached_tokens, completion_tokens) = (
+                    d.finish,
+                    d.prompt_tokens,
+                    d.cached_tokens,
+                    d.completion_tokens,
+                );
                 done = true;
                 break;
             }
@@ -787,12 +997,13 @@ fn stream_response(
                         cancel.store(true, Ordering::Relaxed);
                     }
                 }
-                Event::Done {
+                Event::Done(worker::Done {
                     finish,
                     prompt_tokens,
                     cached_tokens,
                     completion_tokens,
-                } => {
+                    ..
+                }) => {
                     let d = c.finish(&app.tokenizer);
                     emit(d, &mut calls);
                     send(data(chunk(json!({}), Some(c.finish_reason(finish)))));

@@ -37,9 +37,61 @@ struct Entry {
 
 pub struct DiskCache {
     dir: PathBuf,
+    /// Held while the cache is open: one process per directory.
+    _lock: std::fs::File,
     budget: u64,
     manifest: BTreeMap<String, String>,
     entries: Vec<Entry>,
+}
+
+/// A file this cache writes: `<16 hex digits>.safetensors`, or the same
+/// with `.tmp` before the extension while it is being written.
+fn is_cache_file(name: &str) -> bool {
+    let stem = name
+        .strip_suffix(".tmp.safetensors")
+        .or_else(|| name.strip_suffix(".safetensors"));
+    stem.is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Name of the lock file that marks a directory as in use.
+const LOCK: &str = ".lock";
+
+/// The directory this process holds the lock of, if any.
+static OWNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+unsafe extern "C" {
+    fn getuid() -> u32;
+}
+
+/// Deletes the saved conversations in the directory this process locked,
+/// if it locked one (for an exit that skips the cache's own cleanup).
+pub fn remove_owned() -> usize {
+    OWNED.get().map_or(0, |d| remove_saved(d))
+}
+
+/// Deletes the saved conversations in `dir` (only files this cache writes)
+/// and its lock file, then the directory if nothing else is left in it.
+/// Returns the files removed.
+fn remove_saved(dir: &Path) -> usize {
+    let Ok(items) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for item in items.flatten() {
+        let path = item.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_cache_file)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    let _ = std::fs::remove_file(dir.join(LOCK));
+    // Fails (and keeps it) if anything else is in it.
+    let _ = std::fs::remove_dir(dir);
+    removed
 }
 
 fn hash(tokens: &[u32]) -> u64 {
@@ -77,17 +129,44 @@ fn read_entry(path: &Path) -> Result<(BTreeMap<String, String>, Vec<u32>)> {
 
 impl DiskCache {
     pub fn open(dir: &Path, budget: u64, manifest: BTreeMap<String, String>) -> Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // Private to this user: /tmp is shared, and the files are loaded
+        // into the model and deleted at exit.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let md = std::fs::symlink_metadata(dir)?;
+        anyhow::ensure!(
+            md.is_dir(),
+            "{} is a symbolic link or not a directory",
+            dir.display()
+        );
+        anyhow::ensure!(
+            md.uid() == unsafe { getuid() },
+            "{} belongs to another user",
+            dir.display()
+        );
+        let lock = std::fs::File::create(dir.join(LOCK))?;
+        lock.try_lock().map_err(|_| {
+            anyhow::anyhow!(
+                "another process uses {} (give each server its own --disk-cache-dir)",
+                dir.display()
+            )
+        })?;
+        let _ = OWNED.set(dir.to_path_buf());
         let mut entries = Vec::new();
         for item in std::fs::read_dir(dir)? {
             let path = item?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Only files this cache writes are read or deleted.
+            if !is_cache_file(name) {
+                continue;
+            }
             if name.ends_with(".tmp.safetensors") {
                 // Left by a crash mid-save.
                 let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            if !name.ends_with(".safetensors") {
                 continue;
             }
             let ok = read_entry(&path).ok().filter(|(meta, _)| {
@@ -115,6 +194,7 @@ impl DiskCache {
         }
         let mut cache = Self {
             dir: dir.to_path_buf(),
+            _lock: lock,
             budget,
             manifest,
             entries,
@@ -125,6 +205,17 @@ impl DiskCache {
 
     pub fn len(&self) -> usize {
         self.entries.iter().filter(|e| !e.resident).count()
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Deletes every saved conversation (and the directory if it is left
+    /// empty). Returns the files removed.
+    pub fn clear(&mut self) -> usize {
+        self.entries.clear();
+        remove_saved(&self.dir)
     }
 
     pub fn is_empty(&self) -> bool {

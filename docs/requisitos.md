@@ -150,7 +150,7 @@ Cualquier cliente que hoy habla con Ollama por `/v1` debe funcionar sin cambios,
 | `POST /v1/completions` | OpenAI (texto plano) | Deseable |
 | `POST /v1/responses` | OpenAI Responses | Deseable |
 | `POST /v1/messages` | Anthropic Messages, para clientes tipo Claude Code | Deseable |
-| `POST /api/chat`, `GET /api/tags`, `GET /api/ps` | Ollama, solo lo que usan los clientes actuales | Deseable |
+| `POST /api/chat`, `POST /api/generate`, `GET /api/tags`, `POST /api/show`, `GET /api/ps`, `GET /api/version` | Ollama, solo lo que usan los clientes actuales | Deseable |
 | `GET /health`, `GET /metrics` | Estado y métricas Prometheus | Obligatorio |
 
 **Requisitos**
@@ -277,7 +277,7 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 - Requisito 7: un solo slot en un hilo dueño del modelo. Las peticiones esperan en una cola de `--queue` (8); con la cola llena devuelven 429 al instante, y tras `--max-queue-wait` (900 s) de espera, también 429 (probado).
 - K-9: `/metrics` expone el pico de memoria de cada paso de prefill (máximo histórico y de la última petición), el transitorio por encima de lo activo, la memoria activa, velocidades, tokens, cola y rechazos.
 - Revisión (subagente): corregidos los cortes de `stop` en mitad de un carácter UTF-8 (tumbaban la petición), `busy` atascado tras una cancelación, conversaciones bloqueadas por una llamada a herramienta con JSON inválido en el historial, pánicos del hilo del modelo (ahora se capturan y `/health` devuelve 503 si el hilo muere) y la caché de buffers de MLX sin liberar en el decode. Compatibilidad: cuerpos de hasta 256 MB, cualquier `Content-Type`, errores de JSON con la forma de OpenAI, `developer` como `system`, `GET /v1/models/{id}`, CORS para orígenes locales (como Ollama), `seed` y `max_tokens` decimales, 400 con `logprobs`, chunk de error si un stream acaba sin terminar, parada también ante `<|message_user|>`, `<|message_system|>`, `<|message_tool|>` y `<|endoftext|>`, y una cola propia que descarta al momento las peticiones abandonadas. `response_format` (`json_object`, `json_schema`) se traduce en una instrucción de sistema, sin restringir la salida. El puerto se reserva antes de cargar el modelo y la comparación del token es en tiempo constante.
-- Pendiente: los endpoints deseables (`/v1/completions`, `/v1/responses`, `/v1/messages`, `/api/*` de Ollama) y la verificación 7 (una semana con el cliente de 192.168.0.171).
+- Pendiente: la verificación 7 (una semana con el cliente de 192.168.0.171). Los endpoints deseables se añadieron el 23 de noviembre (ver su nota).
 
 **Hito 5: caché de prefijos en RAM (estado)**
 
@@ -293,8 +293,8 @@ Comprobado contra el checkpoint oficial y `mlx-rs` 0.34.0 / `mlx-sys` 0.7.0 (MLX
 
 - C-3: cuando el presupuesto de RAM obliga a expulsar una conversación, se guarda en el SSD. Una petición que la continúa la recupera si el disco tiene más prefijo que la RAM; al cargarse, el archivo se borra (vuelve a disco cuando se expulse otra vez o al cerrar).
 - C-4: un safetensors por conversación, con nombre por hash de su ruta de tokens. Contiene los buffers de las cachés tal cual (sin copias para trocearlos), los tokens, la última instantánea de fin de prompt y un manifiesto en los metadatos: versión de formato, modelo (hash del snapshot), bits y grupo de la caché. Al arrancar se reconstruye el índice leyendo solo cabeceras y tokens; lo que no coincide con el manifiesto se borra. Se escribe a un temporal y se renombra, así un corte nunca deja un archivo a medias.
-- C-5: `--disk-cache-gb` (50 por defecto; 0 lo desactiva) y `--disk-cache-dir` (`~/.cache/calamardo/sessions`). Se expulsa primero lo usado hace más tiempo (fecha de modificación del archivo).
-- C-9: al cerrar con Ctrl-C se guardan en disco las conversaciones de RAM, y al arrancar se precarga la más reciente.
+- C-5: `--disk-cache-gb` (50 por defecto; 0 lo desactiva) y `--disk-cache-dir` (`/tmp/calamardo-cache` desde el 23 de noviembre; antes `~/.cache/calamardo/sessions`). Se expulsa primero lo usado hace más tiempo (fecha de modificación del archivo).
+- C-9: al cerrar con Ctrl-C se guardan en disco las conversaciones de RAM, y al arrancar se precarga la más reciente. Desde el 23 de noviembre, solo con `--keep-disk-cache`: por defecto la caché en disco se borra al salir.
 - Tests con el modelo real: una sesión guardada y cargada sigue generando exactamente los mismos tokens que la original, y su instantánea de fin de prompt reproduce la ejecución en frío (bf16 y 4 bits); un manifiesto distinto se rechaza.
 - Medido en el servidor con 0,3 GB de RAM para la caché (cada conversación nueva expulsa la anterior):
   - 8k tokens: guardar 0,12 s, restaurar 0,02 s; el turno siguiente reutiliza 8.093 de 8.102 tokens y responde en 1,6 s (10,6 s en frío). Tras Ctrl-C y rearranque, la conversación se precarga en 0,10 s y el siguiente turno reutiliza 8.141 tokens.
@@ -507,9 +507,81 @@ El uso previsto es con 512k de contexto, así que las pruebas largas se hacen co
 - La implementación se revisó también frente al `draft.go` de Ollama: tomas de la red (entrada de las pasadas 5, 23 y 41 y salida final normalizada), contexto, ventanas, RoPE, residuos y cabeza Markov con las filas 1…n. Coinciden.
 - Conclusión: el objetivo útil son los tokens por segundo (mediana de 49 tok/s frente a 36,7 de Ollama a 29k), o la tasa medida a la misma profundidad sobre el mismo texto. Con esa medida, Calamardo iguala o supera a Ollama.
 
+**Endpoints adicionales, arranque y benchmark (23 de noviembre de 2026)**
+
+- Todos los endpoints comparten la cola, el slot, la caché de prefijos, el parser de la respuesta y las secuencias de parada de `/v1/chat/completions`. La API key se acepta como `Authorization: Bearer` o como `x-api-key` (clientes de Anthropic).
+- `POST /v1/completions` (OpenAI, texto plano):
+  - El prompt es texto, un único texto en un array o ids de tokens, y se tokeniza tal cual, sin plantilla. `max_tokens` vale 16 por defecto, como en OpenAI.
+  - Admite `echo`, `stop`, `seed` y `stream` (con `stream_options.include_usage`).
+  - `logprobs`, `n` > 1 y `best_of` > 1 dan 400.
+- `POST /v1/responses` (OpenAI Responses):
+  - Entrada: `instructions`; `input` como texto o lista de elementos (`message`, `function_call`, `function_call_output`, `reasoning`); herramientas `function`; `tool_choice: "none"`; `reasoning.effort`; `text.format` (`json_object`, `json_schema`) como instrucción; `max_output_tokens`.
+  - Salida: elementos `reasoning`, `message` y `function_call`. El estado es `incomplete` si se agota `max_output_tokens`.
+  - En streaming emite los eventos `response.*` con `sequence_number`.
+  - Sin estado en el servidor: `previous_response_id` da 400, y hay que mandar la conversación entera.
+- `POST /v1/messages` y `POST /v1/messages/count_tokens` (Anthropic):
+  - Entrada: `system` como texto o bloques; bloques `text`, `tool_use`, `tool_result` (con `is_error`) y `thinking`; herramientas con `input_schema`; `tool_choice: {"type": "none"}`; `stop_sequences`.
+  - `thinking` se traduce a esfuerzo: `disabled` → none; presupuesto < 2.048 → low, < 8.192 → medium y el resto high. Sin `thinking`, se usa el esfuerzo por defecto del servidor.
+  - Respuesta: bloques `thinking` (firma vacía), `text` y `tool_use`; `stop_reason` `end_turn`, `max_tokens`, `stop_sequence` o `tool_use`. `usage` separa `input_tokens` y `cache_read_input_tokens`. En streaming emite los eventos `message_*` y `content_block_*`.
+  - Errores con la forma de Anthropic. Imágenes y herramientas de servidor (búsqueda web, ejecución de código…) dan 400.
+- Ollama (`/api/*`):
+  - `chat` y `generate` hacen streaming NDJSON por defecto. Admiten `options` (`temperature`, `top_p`, `num_predict`, `seed`, `stop`), `think` (booleano o nivel), `format` (`json` o un esquema, como instrucción) y `tools`; `generate` admite además `system` y `raw`.
+  - El objeto final lleva `done_reason` y las duraciones en ns (`prompt_eval_*` cuenta solo lo no cacheado). Sin mensajes o sin prompt se responde `done_reason: "load"`, como Ollama.
+  - `tags`, `show`, `ps` y `version` describen el único modelo. `version` responde 0.12.0, la versión de la API de Ollama que se sigue, porque algunos clientes la comprueban.
+  - Imágenes y `suffix` dan error.
+- Probado en vivo con curl, en streaming y sin él: herramientas, razonamiento, secuencias de parada, `raw`, `format` y los errores. Las traducciones de peticiones tienen tests unitarios.
+- Ojo: con esfuerzo none, la plantilla del modelo todavía razona brevemente; pasa igual en `/v1/chat/completions`.
+- Caché en disco: va ahora a `/tmp/calamardo-cache` y se borra al salir (al cerrar normal, o con la segunda señal). `--keep-disk-cache` recupera el comportamiento anterior: guardar al salir y precargar al arrancar. El borrado solo toca archivos con el nombre de la caché (16 dígitos hexadecimales y `.safetensors`) y luego el directorio, si queda vacío.
+- Al arrancar se imprime:
+  - versión, macOS, chip, núcleos, memoria y límite de memoria cableada;
+  - GPU y versión de MLX;
+  - las variables `CALAMARDO_*`, `MLX_*` y `MTL_*` (con las claves enmascaradas);
+  - la configuración de modelo, servidor, caché KV, caché de prefijos y decodificación especulativa.
+- Estadísticas:
+  - Cada petición servida imprime una línea con el prompt (y lo cacheado), el prefill en tok/s, lo generado en tok/s, los borradores aceptados y el motivo de parada.
+  - Al cerrar se imprime el total: peticiones, y tokens y velocidad de prefill y de generación.
+- Revisión (subagente), corregido:
+  - Los ids de tokens de `/v1/completions` se comprueban contra el vocabulario; antes, un id fuera de rango indexaba más allá de la tabla de embeddings.
+  - La caché en disco:
+    - toma un cerrojo por directorio (un segundo servidor en el mismo directorio arranca sin caché en disco y no toca los archivos del primero);
+    - rechaza un enlace simbólico o un directorio de otro usuario;
+    - crea el directorio con permisos 0700;
+    - solo lee y borra archivos con su nombre. Antes, al abrir, borraba cualquier `.safetensors` que no entendiera.
+  - Los streams de `/v1/completions` y `/v1/responses` escriben un comentario SSE por trozo de prefill, y `/v1/messages` un evento `ping`. Así, un cliente que corta durante un prefill largo libera el slot en segundos (probado con 82k tokens), no al primer token. En NDJSON (Ollama) no se puede escribir nada; se para si el stream ya está cerrado.
+  - Imágenes y documentos en `/v1/messages` (y `input_image`, `input_file` en Responses) se sustituyen por un texto que dice que se omitieron. Antes daban 400, y Claude Code los deja en el historial (capturas, lectura de imágenes), así que fallaba toda la sesión.
+  - Responses:
+    - Al devolver un turno (razonamiento, mensaje, llamada), vuelve a ser un solo mensaje del asistente, igual que se generó; si no, la caché de prefijos fallaba.
+    - El elemento de razonamiento empieza con su parte vacía, para que los clientes acumulen los deltas.
+    - Un error emite `response.failed`.
+    - Una generación vacía emite un mensaje vacío, como sin streaming.
+  - Una generación cortada por el cierre del servidor ya no se informa como `length` o `max_tokens`.
+  - En `scripts/bench.py`:
+    - El decode descuenta la parte estimada del primer trozo (que con drafter puede traer varios tokens) y mide hasta el final del stream.
+    - Las ejecuciones de menos de 16 tokens no entran en las medianas.
+- Verificación 6: `scripts/bench.py` (solo biblioteca estándar de Python).
+  - Mide desde el cliente cualquier servidor compatible con OpenAI, así que sirve también para Ollama: el prefill es prompt / tiempo hasta el primer token, y el decode es (generados − 1) / tiempo entre el primer token y el último.
+  - Cada prompt empieza con un nonce aleatorio, así que no se reutiliza caché, y cada ronda invierte el orden de los objetivos.
+  - Los objetivos pueden ser URLs ya en marcha o comandos (`--launch`) que se arrancan solo durante su turno. Cada arranque hace una petición corta de calentamiento.
+  - Informa de las medianas con mínimo y máximo, la aceptación del drafter si hay `/metrics`, y opcionalmente lo guarda todo en JSON. Ejemplo:
+
+    ```
+    scripts/bench.py --target draft=http://127.0.0.1:8093 --launch "draft=target/release/calamardo serve --addr 127.0.0.1:8093" \
+                     --target nodraft=http://127.0.0.1:8094 --launch "nodraft=target/release/calamardo serve --addr 127.0.0.1:8094 --no-draft" \
+                     --context 1000,8000 --rounds 2 --max-tokens 200
+    ```
+
+  - Resultado (2 rondas, 200 tokens, esfuerzo low):
+
+    | Objetivo | Prompt | Prefill tok/s | Decode tok/s |
+    |---|---|---|---|
+    | Con drafter | 1,1k | 782 (755–808) | 54,7 (47,2–62,2) |
+    | Sin drafter | 1,1k | 817 (805–828) | 41,9 (41,8–41,9) |
+    | Con drafter | 10k | 855 (849–861) | 49,3 (47,2–51,5) |
+    | Sin drafter | 10k | 854 (853–855) | 42,3 (42,2–42,4) |
+
 **Incoherencias a resolver**
 
 1. Con un coste por token lineal en el contexto (solo crecen las 8 pasadas globales), 200 tok/s a 145k implican unos 9,5 min para 164k en frío. Para ≤ 7 min hacen falta unos 300 tok/s a 145k. Resuelto en la práctica: Calamardo hace 401 tok/s a 145k y 5,3 min en frío.
 2. C-1 con instantáneas completas cada 8.192 tokens acumula unos 30–40 GB por conversación de 160k. La caché global solo crece por el final: los bloques sellados deben compartirse entre instantáneas, y solo copiarse las ventanas (unos 168 MB). Matiza el requisito 6 de la caché KV.
-3. El puerto por defecto 11434 choca con Ollama durante las comparativas (verificación 6).
+3. El puerto por defecto 11434 choca con Ollama durante las comparativas (verificación 6). `scripts/bench.py` usa los puertos que se le den, así que basta con arrancar cada servidor en el suyo.
 4. Restaurar 160k desde disco: unos 3,6 GB a 8 bits con drafter y ventanas. Cabe en 2 s solo con lectura directa (mmap) a los buffers.

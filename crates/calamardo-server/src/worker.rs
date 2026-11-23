@@ -50,13 +50,88 @@ pub enum Event {
     },
     Prefill(PrefillChunk),
     Token(u32),
-    Done {
-        finish: Finish,
-        prompt_tokens: usize,
-        cached_tokens: usize,
-        completion_tokens: usize,
-    },
+    Done(Done),
     Error(String),
+}
+
+/// How a job ended, with its counts and timings.
+#[derive(Debug, Clone, Copy)]
+pub struct Done {
+    pub finish: Finish,
+    pub prompt_tokens: usize,
+    pub cached_tokens: usize,
+    pub completion_tokens: usize,
+    /// Seconds of prefill (prompt tokens not from the cache).
+    pub prefill_seconds: f64,
+    /// Seconds from the first generated token to the last.
+    pub decode_seconds: f64,
+    /// Draft tokens proposed and accepted (speculative decoding).
+    pub drafted: usize,
+    pub accepted: usize,
+}
+
+impl Done {
+    /// One line for the log: tokens and speeds.
+    pub fn summary(&self) -> String {
+        let new = self.prompt_tokens - self.cached_tokens;
+        let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+        let mut line = format!(
+            "prompt {} tok ({} cached) · prefill {} tok in {:.2} s ({:.0} tok/s) · generated {} tok in {:.2} s ({:.1} tok/s)",
+            self.prompt_tokens,
+            self.cached_tokens,
+            new,
+            self.prefill_seconds,
+            rate(new, self.prefill_seconds),
+            self.completion_tokens,
+            self.decode_seconds,
+            rate(
+                self.completion_tokens.saturating_sub(1),
+                self.decode_seconds
+            ),
+        );
+        if self.drafted > 0 {
+            line += &format!(
+                " · drafts {}/{} accepted ({:.0}%)",
+                self.accepted,
+                self.drafted,
+                100.0 * self.accepted as f64 / self.drafted as f64
+            );
+        }
+        line + &format!(" · {:?}", self.finish).to_lowercase()
+    }
+}
+
+/// Totals of the requests served, for the summary at shutdown.
+#[derive(Default)]
+struct Served {
+    requests: usize,
+    prefill_tokens: usize,
+    prefill_seconds: f64,
+    generated: usize,
+    decode_seconds: f64,
+}
+
+impl Served {
+    fn add(&mut self, d: &Done) {
+        self.requests += 1;
+        self.prefill_tokens += d.prompt_tokens - d.cached_tokens;
+        self.prefill_seconds += d.prefill_seconds;
+        self.generated += d.completion_tokens.saturating_sub(1);
+        self.decode_seconds += d.decode_seconds;
+    }
+
+    fn summary(&self) -> String {
+        let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+        format!(
+            "served {} request{}: prefill {} tok at {:.0} tok/s, generated {} tok at {:.1} tok/s",
+            self.requests,
+            if self.requests == 1 { "" } else { "s" },
+            self.prefill_tokens,
+            rate(self.prefill_tokens, self.prefill_seconds),
+            self.generated,
+            rate(self.generated, self.decode_seconds),
+        )
+    }
 }
 
 /// Jobs waiting for the slot. Cancelled jobs (timed out in the queue, client
@@ -166,6 +241,9 @@ pub struct WorkerConfig {
     pub aligned_prefix: bool,
     /// Directory and byte budget of the prefix cache on disk, if enabled.
     pub disk: Option<(PathBuf, u64)>,
+    /// Keep the disk cache after exit (saving the conversations in RAM and
+    /// preloading the latest at the next start); otherwise it is deleted.
+    pub keep_disk_cache: bool,
     /// Identifies the checkpoint in saved sessions (see `model_id`).
     pub model_id: String,
     /// Speculative decoding with the bundled DSpark drafter (M-7).
@@ -390,6 +468,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("calamardo-model".into())
         .spawn(move || {
+            let load_start = Instant::now();
             let loaded = Model::load(&config.model_dir).and_then(|m| {
                 // Drafting decides by measured speed, so its output is not
                 // reproducible: off when bit-exact output is asked for.
@@ -414,9 +493,11 @@ pub fn spawn(
                 }
             };
             eprintln!(
-                "speculative decoding: {}",
+                "model loaded in {:.1} s · {:.1} GB active · speculative decoding {}",
+                load_start.elapsed().as_secs_f64(),
+                mlx_rs::memory::active_memory().unwrap_or(0) as f64 / 1e9,
                 if drafter.is_some() {
-                    "DSpark drafter"
+                    "on (DSpark drafter)"
                 } else {
                     "off"
                 }
@@ -455,6 +536,8 @@ pub fn spawn(
             let draft_ceiling = drafter
                 .as_ref()
                 .map(|d| config.draft_block.min(d.block_size));
+            let mut served = Served::default();
+            let mut served_id = 0usize;
             while let Some(job) = queue.pop() {
                 metrics.set_queue(queue.len());
                 queue.set_current(Some(job.cancel.clone()));
@@ -463,8 +546,13 @@ pub fn spawn(
                     run(&mut session, cached, &config, &job, &metrics, draft_ceiling)
                 }));
                 queue.set_current(None);
+                served_id += 1;
                 match result {
-                    Ok(Ok(())) => cache.put(session),
+                    Ok(Ok(done)) => {
+                        eprintln!("[request {served_id}] {}", done.summary());
+                        served.add(&done);
+                        cache.put(session)
+                    }
                     // Keep what was processed: a retry continues from it (C-7).
                     Ok(Err(e)) if e.downcast_ref::<Cancelled>().is_some() => cache.put(session),
                     Ok(Err(e)) => {
@@ -497,8 +585,19 @@ pub fn spawn(
                 metrics.set_cache(cache.entries.len(), cache.bytes());
                 metrics.set_active(mlx_rs::memory::active_memory().unwrap_or(0));
             }
-            // Shutting down: keep the conversations for the next start.
-            cache.flush();
+            if served.requests > 0 {
+                eprintln!("{}", served.summary());
+            }
+            if config.keep_disk_cache {
+                // Shutting down: keep the conversations for the next start.
+                cache.flush();
+            } else if let Some(d) = cache.disk.as_mut() {
+                let n = d.clear();
+                eprintln!(
+                    "deleted the disk cache ({n} files in {})",
+                    d.dir().display()
+                );
+            }
         })
         .expect("spawning the model thread")
 }
@@ -510,7 +609,7 @@ fn run(
     job: &Job,
     metrics: &Metrics,
     draft_ceiling: Option<usize>,
-) -> Result<()> {
+) -> Result<Done> {
     let send = |e: Event| {
         if job.events.send(e).is_err() {
             // The request is gone: stop at the next check.
@@ -527,7 +626,9 @@ fn run(
         metrics.prefill_chunk(&c);
         send(Event::Prefill(c));
     })?;
-    metrics.prefill_done(job.prompt.len() - cached, t.elapsed().as_secs_f64());
+    let prefill_seconds = t.elapsed().as_secs_f64();
+    metrics.prefill_done(job.prompt.len() - cached, prefill_seconds);
+    let (mut drafted, mut accepted) = (0, 0);
 
     let mut sampler = Sampler::new(job.temperature, job.top_p, job.seed);
     let mut policy = draft_ceiling
@@ -558,6 +659,8 @@ fn run(
                 p.record(block, r.tokens.len(), step.elapsed().as_secs_f64());
             }
             metrics.draft(r.accepted, r.drafted);
+            drafted += r.drafted;
+            accepted += r.accepted;
             for &tok in &r.tokens {
                 n += 1;
                 send(Event::Token(tok));
@@ -581,12 +684,18 @@ fn run(
             calamardo_model::ops::clear_cache();
         }
     };
-    metrics.decode_done(n, t.elapsed().as_secs_f64());
-    send(Event::Done {
+    let decode_seconds = t.elapsed().as_secs_f64();
+    metrics.decode_done(n, decode_seconds);
+    let done = Done {
         finish,
         prompt_tokens: job.prompt.len(),
         cached_tokens: cached,
         completion_tokens: n,
-    });
-    Ok(())
+        prefill_seconds,
+        decode_seconds,
+        drafted,
+        accepted,
+    };
+    send(Event::Done(done));
+    Ok(done)
 }
