@@ -43,7 +43,19 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_TEXT = os.path.join(ROOT, "docs", "requisitos.md")
+
+
+def default_text() -> str:
+    """The repository's Rust sources, in a fixed order: long, and the same
+    text on every machine with the same checkout."""
+    parts = []
+    for base, dirs, files in sorted(os.walk(os.path.join(ROOT, "crates"))):
+        dirs[:] = sorted(d for d in dirs if d not in ("vendor", "target"))
+        for name in sorted(files):
+            if name.endswith(".rs"):
+                with open(os.path.join(base, name), encoding="utf-8") as f:
+                    parts.append(f.read())
+    return "\n".join(parts)
 QUESTION = "Summarize the text above in five sentences."
 # Fewer generated tokens than this say little about decode speed.
 MIN_GENERATED = 16
@@ -190,7 +202,7 @@ def main() -> None:
     p.add_argument("--effort", default="low",
                    help="reasoning_effort sent with each request ('' to omit; default low)")
     p.add_argument("--model", default="calamardo", help="model name sent with each request")
-    p.add_argument("--text", default=DEFAULT_TEXT, help="text the prompts are built from")
+    p.add_argument("--text", help="file the prompts are built from (default: the Rust sources)")
     p.add_argument("--api-key", default=os.environ.get("CALAMARDO_API_KEY"))
     p.add_argument("--timeout", type=float, default=3600, help="seconds per request")
     p.add_argument("--startup-timeout", type=float, default=600)
@@ -205,7 +217,7 @@ def main() -> None:
         if name not in targets:
             raise SystemExit(f"--launch names {name!r}, which is not a --target")
     sizes = [int(s) for s in args.context.split(",") if s.strip()]
-    text = open(args.text, encoding="utf-8").read()
+    text = open(args.text, encoding="utf-8").read() if args.text else default_text()
     rng = random.Random(args.seed)
     names = list(targets)
     results = []
