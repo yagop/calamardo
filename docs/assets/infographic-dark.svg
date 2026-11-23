@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 1125" width="2000" height="1125" role="img" aria-label="Calamardo: 43.9 tok/s decode at a 64K-token context on a Mac Studio M4 Max, 2.8x stock Ollama">
+  <title>Calamardo vs Ollama: Inkling 2 Mini on a Mac Studio M4 Max</title>
+  <defs>
+    <style>
+      .sans { font-family: Inter, 'SF Pro Display', -apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif; }
+      .mono { font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace; }
+    </style>
+    <linearGradient id="fade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#bdbdbd"/>
+      <stop offset="1" stop-color="#5a5a5a"/>
+    </linearGradient>
+    <clipPath id="card"><rect x="48" y="48" width="1904" height="1029" rx="28"/></clipPath>
+  </defs>
+
+  <rect width="2000" height="1125" fill="#000"/>
+  <rect x="48" y="48" width="1904" height="1029" rx="28" fill="#040404" stroke="#1c1c1c" stroke-width="2"/>
+
+  <!-- sonar rings -->
+  <g clip-path="url(#card)" fill="none" stroke="#fff" stroke-opacity="0.045" stroke-width="1.5">
+    <circle cx="1735" cy="215" r="40"/><circle cx="1735" cy="215" r="70"/><circle cx="1735" cy="215" r="100"/>
+    <circle cx="1735" cy="215" r="130"/><circle cx="1735" cy="215" r="160"/><circle cx="1735" cy="215" r="190"/>
+    <circle cx="1735" cy="215" r="220"/><circle cx="1735" cy="215" r="250"/><circle cx="1735" cy="215" r="280"/>
+    <circle cx="1735" cy="215" r="310"/><circle cx="1735" cy="215" r="340"/><circle cx="1735" cy="215" r="370"/>
+    <circle cx="1735" cy="215" r="400"/><circle cx="1735" cy="215" r="430"/><circle cx="1735" cy="215" r="460"/>
+  </g>
+
+  <!-- header -->
+  <g transform="translate(108 76) scale(0.95)">
+    <path d="M16 1 C23 8 25 15 24 24 L8 24 C7 15 9 8 16 1Z M9 8 L3 13 L9 15Z M23 8 L29 13 L23 15Z" fill="#d6d6d6"/>
+    <circle cx="12.5" cy="20.5" r="1.7" fill="#040404"/><circle cx="19.5" cy="20.5" r="1.7" fill="#040404"/>
+    <path d="M9 24 C8 30 5 32 6 38 M13 24 C13 31 11 34 12 39 M19 24 C19 31 21 34 20 39 M23 24 C24 30 27 32 26 38" stroke="#d6d6d6" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+  </g>
+  <text x="150" y="110" class="sans" font-size="27" font-weight="600" letter-spacing="7" fill="#d6d6d6">CALAMARDO</text>
+  <text x="1890" y="108" class="mono" font-size="22" letter-spacing="6" fill="#9a9a9a" text-anchor="end">RUST · MLX · METAL</text>
+
+  <!-- title -->
+  <text x="106" y="262" class="sans" font-size="68" font-weight="700" fill="#f2f2f2">Inkling 2 Mini, served</text>
+  <text x="106" y="340" class="sans" font-size="68" font-weight="700" fill="url(#fade)">in Rust on Apple Silicon</text>
+
+  <!-- hero -->
+  <text x="100" y="600" class="sans" fill="#fff"><tspan font-size="270" font-weight="800" letter-spacing="-3">43.9</tspan><tspan font-size="64" font-weight="600" fill="#8c8c8c" dx="20">tok/s</tspan></text>
+  <text x="108" y="672" class="sans" font-size="31" fill="#b5b5b5">decoding at a <tspan fill="#fff" font-weight="700">64K-token context</tspan>, <tspan fill="#fff" font-weight="700">2.8× stock Ollama</tspan>.</text>
+
+  <!-- pills -->
+  <g class="sans" font-size="24" font-weight="600" fill="#fff" text-anchor="middle">
+    <rect x="107" y="716" width="282" height="56" rx="28" fill="#0e0e0e" stroke="#2c2c2c" stroke-width="2"/>
+    <text x="248" y="752">2.5× faster prefill</text>
+    <rect x="407" y="716" width="252" height="56" rx="28" fill="#0e0e0e" stroke="#2c2c2c" stroke-width="2"/>
+    <text x="533" y="752">no crash at 128K</text>
+    <rect x="677" y="716" width="252" height="56" rx="28" fill="#0e0e0e" stroke="#2c2c2c" stroke-width="2"/>
+    <text x="803" y="752">1M-token context</text>
+  </g>
+
+  <!-- bar groups -->
+  <g class="sans" font-size="24">
+    <!-- prefill 64K -->
+    <text x="1047" y="224" class="mono" font-size="25" letter-spacing="3" fill="#a8a8a8">PREFILL <tspan fill="#5e5e5e" letter-spacing="0">tok/s, 64K prompt</tspan></text>
+    <text x="1047" y="272" font-weight="700" fill="#fff">Calamardo · 8-bit KV</text>
+    <text x="1047" y="314" fill="#b8b8b8">Calamardo · 16-bit KV</text>
+    <text x="1047" y="356" fill="#8a8a8a">Ollama v0.40.17</text>
+    <rect x="1330" y="255" width="358" height="24" rx="4" fill="#f2f2f2"/>
+    <rect x="1330" y="297" width="360" height="24" rx="4" fill="#8a8a8a"/>
+    <rect x="1330" y="339" width="144" height="24" rx="4" fill="#3a3a3a"/>
+    <g class="mono" font-size="26" font-weight="600" fill="#fff">
+      <text x="1706" y="276">710</text><text x="1708" y="318">714</text><text x="1492" y="360" fill="#b0b0b0">285</text>
+    </g>
+
+    <!-- decode 64K -->
+    <text x="1047" y="426" class="mono" font-size="25" letter-spacing="3" fill="#a8a8a8">DECODE <tspan fill="#5e5e5e" letter-spacing="0">tok/s, 64K prompt</tspan></text>
+    <text x="1047" y="474" font-weight="700" fill="#fff">Calamardo · 8-bit KV</text>
+    <text x="1047" y="516" fill="#b8b8b8">Calamardo · 16-bit KV</text>
+    <text x="1047" y="558" fill="#8a8a8a">Ollama v0.40.17</text>
+    <rect x="1330" y="457" width="360" height="24" rx="4" fill="#f2f2f2"/>
+    <rect x="1330" y="499" width="308" height="24" rx="4" fill="#8a8a8a"/>
+    <rect x="1330" y="541" width="130" height="24" rx="4" fill="#3a3a3a"/>
+    <g class="mono" font-size="26" font-weight="600" fill="#fff">
+      <text x="1708" y="478">43.9</text><text x="1656" y="520">37.6</text><text x="1478" y="562" fill="#b0b0b0">15.9</text>
+    </g>
+
+    <!-- decode 128K -->
+    <text x="1047" y="628" class="mono" font-size="25" letter-spacing="3" fill="#a8a8a8">DECODE <tspan fill="#5e5e5e" letter-spacing="0">tok/s, 128K prompt</tspan></text>
+    <text x="1047" y="676" font-weight="700" fill="#fff">Calamardo · 8-bit KV</text>
+    <text x="1047" y="718" fill="#b8b8b8">Calamardo · 16-bit KV</text>
+    <text x="1047" y="760" fill="#8a8a8a">Ollama v0.40.17</text>
+    <rect x="1330" y="659" width="360" height="24" rx="4" fill="#f2f2f2"/>
+    <rect x="1330" y="701" width="321" height="24" rx="4" fill="#8a8a8a"/>
+    <rect x="1331" y="744" width="120" height="22" rx="4" fill="none" stroke="#ff5f57" stroke-width="2" stroke-dasharray="6 5"/>
+    <g class="mono" font-size="26" font-weight="600" fill="#fff">
+      <text x="1708" y="680">35.8</text><text x="1669" y="722">31.9</text>
+    </g>
+    <text x="1469" y="762" class="mono" font-size="22" fill="#ff5f57">✕ crashed · HTTP 500</text>
+  </g>
+
+  <!-- footer -->
+  <line x1="107" y1="946" x2="1893" y2="946" stroke="#222" stroke-width="2"/>
+  <rect x="107" y="980" width="590" height="68" rx="12" fill="#0c0c0c" stroke="#262626" stroke-width="2"/>
+  <text x="132" y="1024" class="mono" font-size="26" fill="#eaeaea"><tspan fill="#777">$</tspan> target/release/calamardo serve</text>
+  <text x="1893" y="1004" class="sans" font-size="24" fill="#8a8a8a" text-anchor="end">github.com/yagop/calamardo</text>
+  <text x="1893" y="1038" class="sans" font-size="22" fill="#6f6f6f" text-anchor="end">Mac Studio M4 Max · 40-core GPU · 48 GB · vs Ollama v0.40.17 · measured 2026-11-23</text>
+</svg>

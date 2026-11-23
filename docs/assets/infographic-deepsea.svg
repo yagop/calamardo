@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 1125" width="2000" height="1125" role="img" aria-label="Calamardo decodes 2.8x faster than stock Ollama at a 64K-token context and keeps going to 516K tokens">
+  <title>Calamardo vs Ollama: decode speed across context lengths</title>
+  <defs>
+    <style>
+      .sans { font-family: Inter, 'SF Pro Display', -apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif; }
+      .mono { font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace; }
+    </style>
+    <linearGradient id="sea" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="#03142c"/>
+      <stop offset="1" stop-color="#062a45"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.82" cy="0.05" r="0.6">
+      <stop offset="0" stop-color="#35e0c2" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#35e0c2" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#35e0c2" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#35e0c2" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="2000" height="1125" fill="url(#sea)"/>
+  <rect width="2000" height="1125" fill="url(#glow)"/>
+  <!-- bubbles -->
+  <g fill="none" stroke="#7fe9d6" stroke-opacity="0.18" stroke-width="2">
+    <circle cx="935" cy="140" r="9"/><circle cx="958" cy="104" r="5"/><circle cx="944" cy="76" r="3"/>
+    <circle cx="70" cy="560" r="6"/><circle cx="52" cy="520" r="3.5"/>
+  </g>
+
+  <!-- header -->
+  <g transform="translate(100 70)">
+    <path d="M16 1 C23 8 25 15 24 24 L8 24 C7 15 9 8 16 1Z M9 8 L3 13 L9 15Z M23 8 L29 13 L23 15Z" fill="#35e0c2"/>
+    <circle cx="12.5" cy="20.5" r="1.7" fill="#04182f"/><circle cx="19.5" cy="20.5" r="1.7" fill="#04182f"/>
+    <path d="M9 24 C8 30 5 32 6 38 M13 24 C13 31 11 34 12 39 M19 24 C19 31 21 34 20 39 M23 24 C24 30 27 32 26 38" stroke="#35e0c2" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+  </g>
+  <text x="146" y="104" class="sans" font-size="28" font-weight="700" letter-spacing="7" fill="#eaf4ff">CALAMARDO</text>
+  <text x="1900" y="102" class="mono" font-size="21" letter-spacing="5" fill="#8fa6c4" text-anchor="end">INKLING 2 MINI · RUST · MLX · METAL</text>
+
+  <!-- left: hero -->
+  <text x="100" y="214" class="mono" font-size="22" letter-spacing="4" fill="#35e0c2">DECODE SPEED AT A 64K-TOKEN PROMPT</text>
+  <text x="92" y="420" class="sans" font-size="236" font-weight="800" letter-spacing="-4" fill="#eaf4ff">2.8×</text>
+  <text x="100" y="482" class="sans" font-size="34" fill="#c9d8ea">faster than stock Ollama, on the same Mac.</text>
+  <text x="100" y="526" class="mono" font-size="21" fill="#8fa6c4">43.9 vs 15.9 tok/s · same checkpoint · same drafter</text>
+
+  <!-- stat cards -->
+  <g class="sans">
+    <rect x="100" y="580" width="390" height="160" rx="18" fill="#ffffff" fill-opacity="0.04" stroke="#35e0c2" stroke-opacity="0.28" stroke-width="2"/>
+    <text x="130" y="652" font-size="58" font-weight="800" fill="#35e0c2">2.5×</text>
+    <text x="130" y="692" font-size="23" fill="#eaf4ff">faster prefill at 64K</text>
+    <text x="130" y="720" class="mono" font-size="18" fill="#8fa6c4">714 vs 285 tok/s</text>
+
+    <rect x="510" y="580" width="390" height="160" rx="18" fill="#ffffff" fill-opacity="0.04" stroke="#35e0c2" stroke-opacity="0.28" stroke-width="2"/>
+    <text x="540" y="652" font-size="58" font-weight="800" fill="#35e0c2">516K</text>
+    <text x="540" y="692" font-size="23" fill="#eaf4ff">tokens, still 20.8 tok/s</text>
+    <text x="540" y="720" class="mono" font-size="18" fill="#8fa6c4">Ollama died at 128K</text>
+
+    <rect x="100" y="760" width="390" height="160" rx="18" fill="#ffffff" fill-opacity="0.04" stroke="#35e0c2" stroke-opacity="0.28" stroke-width="2"/>
+    <text x="130" y="832" font-size="58" font-weight="800" fill="#35e0c2">2 s</text>
+    <text x="130" y="872" font-size="23" fill="#eaf4ff">to restore a 516K-token chat</text>
+    <text x="130" y="900" class="mono" font-size="18" fill="#8fa6c4">saved to disk in 4 s</text>
+
+    <rect x="510" y="760" width="390" height="160" rx="18" fill="#ffffff" fill-opacity="0.04" stroke="#35e0c2" stroke-opacity="0.28" stroke-width="2"/>
+    <text x="540" y="832" font-size="58" font-weight="800" fill="#35e0c2">&lt; 3 GB</text>
+    <text x="540" y="872" font-size="23" fill="#eaf4ff">prefill transient at 516K</text>
+    <text x="540" y="900" class="mono" font-size="18" fill="#8fa6c4">chunked, bounded memory</text>
+  </g>
+
+  <!-- right: chart panel -->
+  <rect x="990" y="170" width="910" height="750" rx="24" fill="#ffffff" fill-opacity="0.035" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+  <text x="1030" y="226" class="mono" font-size="22" letter-spacing="4" fill="#c9d8ea">DECODE tok/s <tspan fill="#8fa6c4" letter-spacing="0">vs prompt length</tspan></text>
+
+  <!-- legend -->
+  <g class="sans" font-size="20" fill="#c9d8ea">
+    <line x1="1032" y1="266" x2="1066" y2="266" stroke="#35e0c2" stroke-width="5" stroke-linecap="round"/>
+    <text x="1076" y="273">Calamardo · 8-bit KV</text>
+    <line x1="1312" y1="266" x2="1346" y2="266" stroke="#7aa7ff" stroke-width="4" stroke-linecap="round"/>
+    <text x="1356" y="273">Calamardo · 16-bit KV</text>
+    <line x1="1600" y1="266" x2="1634" y2="266" stroke="#f2a07b" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 8"/>
+    <text x="1644" y="273">Ollama v0.40.17</text>
+  </g>
+
+  <!-- grid -->
+  <g stroke="#ffffff" stroke-opacity="0.08" stroke-width="1.5">
+    <line x1="1090" y1="320" x2="1870" y2="320"/>
+    <line x1="1090" y1="466.7" x2="1870" y2="466.7"/>
+    <line x1="1090" y1="613.3" x2="1870" y2="613.3"/>
+  </g>
+  <line x1="1090" y1="760" x2="1870" y2="760" stroke="#ffffff" stroke-opacity="0.25" stroke-width="2"/>
+  <g class="mono" font-size="18" fill="#6f87a6" text-anchor="end">
+    <text x="1076" y="326">60</text><text x="1076" y="473">40</text><text x="1076" y="619">20</text><text x="1076" y="766">0</text>
+  </g>
+  <g class="mono" font-size="20" fill="#8fa6c4" text-anchor="middle">
+    <text x="1110" y="796">2K</text><text x="1290" y="796">64K</text><text x="1470" y="796">128K</text><text x="1650" y="796">256K</text><text x="1830" y="796">516K</text>
+  </g>
+
+  <!-- area under 8-bit -->
+  <path d="M1110 366.2 L1290 438.1 L1470 497.5 L1650 520.2 L1830 607.5 L1830 760 L1110 760Z" fill="url(#area)"/>
+
+  <!-- Ollama -->
+  <polyline points="1110,489.4 1290,643.4" fill="none" stroke="#f2a07b" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 9"/>
+  <line x1="1290" y1="643.4" x2="1470" y2="738" stroke="#ff5d6c" stroke-width="2.5" stroke-dasharray="4 7" stroke-opacity="0.8"/>
+  <circle cx="1110" cy="489.4" r="7" fill="#f2a07b"/><circle cx="1290" cy="643.4" r="7" fill="#f2a07b"/>
+  <g stroke="#ff5d6c" stroke-width="5" stroke-linecap="round"><line x1="1459" y1="727" x2="1481" y2="749"/><line x1="1481" y1="727" x2="1459" y2="749"/></g>
+  <text x="1496" y="745" class="mono" font-size="18" fill="#ff8a95">runner died · HTTP 500</text>
+
+  <!-- Calamardo 16-bit -->
+  <polyline points="1110,394.1 1290,484.3 1470,526.1 1650,574.5" fill="none" stroke="#7aa7ff" stroke-width="4" stroke-linejoin="round"/>
+  <g fill="#7aa7ff"><circle cx="1110" cy="394.1" r="7"/><circle cx="1290" cy="484.3" r="7"/><circle cx="1470" cy="526.1" r="7"/><circle cx="1650" cy="574.5" r="7"/></g>
+
+  <!-- Calamardo 8-bit -->
+  <polyline points="1110,366.2 1290,438.1 1470,497.5 1650,520.2 1830,607.5" fill="none" stroke="#35e0c2" stroke-width="5" stroke-linejoin="round"/>
+  <g fill="#35e0c2" stroke="#04203a" stroke-width="3"><circle cx="1110" cy="366.2" r="9"/><circle cx="1290" cy="438.1" r="9"/><circle cx="1470" cy="497.5" r="9"/><circle cx="1650" cy="520.2" r="9"/><circle cx="1830" cy="607.5" r="9"/></g>
+
+  <!-- point labels -->
+  <g class="mono" font-size="19" font-weight="700" text-anchor="middle">
+    <g fill="#35e0c2"><text x="1110" y="346">53.7</text><text x="1290" y="418">43.9</text><text x="1470" y="477">35.8</text><text x="1650" y="500">32.7</text><text x="1830" y="587">20.8</text></g>
+    <g fill="#7aa7ff"><text x="1110" y="426">49.9</text><text x="1290" y="516">37.6</text><text x="1470" y="558">31.9</text><text x="1650" y="606">25.3</text></g>
+    <g fill="#f2a07b" text-anchor="end"><text x="1096" y="496">36.9</text><text x="1276" y="672">15.9</text></g>
+  </g>
+
+  <!-- prefill strip -->
+  <line x1="1030" y1="826" x2="1860" y2="826" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1.5"/>
+  <text x="1030" y="862" class="mono" font-size="18" letter-spacing="3" fill="#8fa6c4">PREFILL tok/s</text>
+  <text x="1030" y="890" class="mono" font-size="16" fill="#6f87a6"><tspan fill="#7aa7ff">16-bit</tspan> / <tspan fill="#f2a07b">Ollama</tspan></text>
+  <g class="mono" font-size="22" font-weight="700" text-anchor="middle">
+    <text x="1290" y="880"><tspan fill="#7aa7ff">873</tspan><tspan fill="#6f87a6"> / </tspan><tspan fill="#f2a07b">605</tspan></text>
+    <text x="1470" y="880"><tspan fill="#7aa7ff">714</tspan><tspan fill="#6f87a6"> / </tspan><tspan fill="#f2a07b">285</tspan></text>
+    <text x="1650" y="880"><tspan fill="#7aa7ff">586</tspan><tspan fill="#6f87a6"> / </tspan><tspan fill="#ff5d6c">✕</tspan></text>
+    <text x="1820" y="880"><tspan fill="#7aa7ff">397</tspan><tspan fill="#6f87a6"> / —</tspan></text>
+  </g>
+  <g class="mono" font-size="15" fill="#6f87a6" text-anchor="middle">
+    <text x="1290" y="904">2K</text><text x="1470" y="904">64K</text><text x="1650" y="904">128K</text><text x="1820" y="904">256K</text>
+  </g>
+
+  <!-- footer -->
+  <text x="100" y="1030" class="mono" font-size="24" fill="#eaf4ff"><tspan fill="#35e0c2">$</tspan> target/release/calamardo serve</text>
+  <text x="100" y="1066" class="sans" font-size="20" fill="#8fa6c4">OpenAI, Anthropic and Ollama APIs on :11434 · prefix cache in RAM and on disk</text>
+  <text x="1900" y="1030" class="sans" font-size="23" fill="#c9d8ea" text-anchor="end">github.com/yagop/calamardo</text>
+  <text x="1900" y="1066" class="sans" font-size="20" fill="#6f87a6" text-anchor="end">Mac Studio M4 Max · 40-core GPU · 48 GB · measured 2026-11-23</text>
+</svg>

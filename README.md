@@ -2,6 +2,8 @@
 
 A Rust runtime that serves [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on Apple Silicon Macs, built on [MLX](https://github.com/ml-explore/mlx).
 
+![Calamardo decodes 2.8× faster than stock Ollama at a 64K-token prompt on a Mac Studio M4 Max, and keeps going to 516K tokens where Ollama crashes at 128K](docs/assets/infographic-deepsea.svg)
+
 - **Long contexts without memory spikes:** chunked prefill with a bounded transient (under 3 GB above active memory at 516k tokens), a 4-, 8- or 16-bit global KV cache, and bf16 sliding windows.
 - **Prefix cache in RAM and on disk:** each turn only processes what is new. A 516k-token conversation is saved in 4 s and restored in 2 s.
 - **Speculative decoding** with the DSpark drafter that ships with the checkpoint.
