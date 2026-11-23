@@ -10,16 +10,18 @@ A Rust runtime that serves [Inkling 2 Mini](https://huggingface.co/thinkingmachi
 
 ## Performance
 
-Mac Studio M4 Max (40-core GPU, 48 GB), compared with a patched Ollama 0.40.17 on the same machine:
+Stock [Ollama v0.40.17](https://github.com/ollama/ollama/releases/tag/v0.40.17) (the latest release, unmodified) against Calamardo on a Mac Studio M4 Max (40-core GPU, 48 GB). Both serve the same checkpoint with its drafter. Calamardo runs with an unquantized 16-bit KV cache, like Ollama's default, and with its own default 8-bit cache.
 
-| Measure | Ollama | Calamardo |
-|---|---|---|
-| Decode at 29k context, with drafter | 36.7 tok/s | ~49 tok/s (median) |
-| Prefill at ~145k context | ~90 tok/s | 401 tok/s |
-| Cold prefill of 164k tokens | ~15 min | 5.3 min |
-| Context kept between turns | ~150k tokens | 516k (RAM and disk) |
+| Prompt | Ollama prefill | Calamardo prefill (16 / 8-bit) | Ollama decode | Calamardo decode (16 / 8-bit) |
+|---|---|---|---|---|
+| 2k tokens | 605 tok/s | 873 / 847 tok/s | 36.9 tok/s | 49.9 / 53.7 tok/s |
+| 64k | 285 tok/s | 714 / 710 tok/s | 15.9 tok/s | 37.6 / 43.9 tok/s |
+| 128k | fails | 586 / 576 tok/s | fails | 31.9 / 35.8 tok/s |
+| 256k | — | 397 / 383 tok/s | — | 25.3 / 32.7 tok/s |
 
-At 516k tokens of context with an 8-bit cache, decode runs at 20.8 tok/s with the drafter and 17.4 tok/s without it.
+- **Ollama at 128k:** during the prefill its runner's memory footprint swings up to 45–47 GB, and the runner dies without an error message; the request gets a 500. The same happens with `OLLAMA_KV_CACHE_TYPE=q8_0`. 256k was not attempted.
+- **Calamardo at 256k:** the first token comes after 11 minutes (638 s with the 16-bit cache). At 516k tokens with the 8-bit cache, decode runs at 20.8 tok/s, and a conversation is saved to disk in 4 s and restored in 2 s.
+- **Method:** [`scripts/bench.py`](scripts/bench.py) on 23 November 2026, with the repository's Rust sources as the prompt text, a unique nonce per prompt (no cache reuse), `reasoning_effort: low`, temperature 0 and 256 generated tokens. Ollama ran with `OLLAMA_CONTEXT_LENGTH=300000`. Prompts of 2k and 64k ran 2 rounds in alternating order, and the table gives the medians; 128k and 256k ran once. Decode speed with a drafter depends on how many drafts are accepted, which varies with the text: Calamardo ranged from 41 to 59 tok/s at 2k.
 
 ## Requirements
 

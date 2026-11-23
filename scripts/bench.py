@@ -61,10 +61,9 @@ QUESTION = "Summarize the text above in five sentences."
 MIN_GENERATED = 16
 
 
-def build_prompt(text: str, tokens: int, nonce: str) -> str:
-    """About `tokens` tokens of `text` (4 characters per token), repeated as
-    needed, after a nonce."""
-    chars = max(tokens * 4, 1)
+def build_prompt(text: str, tokens: int, nonce: str, chars_per_token: float) -> str:
+    """About `tokens` tokens of `text`, repeated as needed, after a nonce."""
+    chars = max(int(tokens * chars_per_token), 1)
     body = (text * (chars // max(len(text), 1) + 1))[:chars]
     return f"[{nonce}]\n{body}\n\n{QUESTION}"
 
@@ -203,6 +202,10 @@ def main() -> None:
                    help="reasoning_effort sent with each request ('' to omit; default low)")
     p.add_argument("--model", default="calamardo", help="model name sent with each request")
     p.add_argument("--text", help="file the prompts are built from (default: the Rust sources)")
+    p.add_argument("--chars-per-token", type=float, default=2.7,
+                   help="characters per token of the text, to size the prompts "
+                        "(default 2.7, measured on the Rust sources with Inkling's tokenizer; "
+                        "about 4 for English prose)")
     p.add_argument("--api-key", default=os.environ.get("CALAMARDO_API_KEY"))
     p.add_argument("--timeout", type=float, default=3600, help="seconds per request")
     p.add_argument("--startup-timeout", type=float, default=600)
@@ -241,12 +244,12 @@ def main() -> None:
                 wait_ready(base, proc, args.startup_timeout)
                 # A short request first: kernels compile and the first
                 # allocations happen outside the measurements.
-                stream_chat(base, args.model, build_prompt(text, 64, f"warmup-{rng.getrandbits(64):016x}"),
+                stream_chat(base, args.model, build_prompt(text, 64, f"warmup-{rng.getrandbits(64):016x}", args.chars_per_token),
                             argparse.Namespace(**{**vars(args), "max_tokens": 8}))
                 for size in sizes:
                     for _ in range(args.requests):
                         before = metrics(base)
-                        r = stream_chat(base, args.model, build_prompt(text, size, f"{rng.getrandbits(64):016x}"), args)
+                        r = stream_chat(base, args.model, build_prompt(text, size, f"{rng.getrandbits(64):016x}", args.chars_per_token), args)
                         after = metrics(base)
                         drafted = after.get("calamardo_drafted_tokens_total", 0) - before.get("calamardo_drafted_tokens_total", 0)
                         accepted = after.get("calamardo_accepted_tokens_total", 0) - before.get("calamardo_accepted_tokens_total", 0)
