@@ -1,5 +1,6 @@
-//! HTTP routes: OpenAI Chat Completions (streaming and not), models, health
-//! and metrics.
+//! The router, OpenAI Chat Completions and Models, health and metrics, and
+//! what every API shares: authentication, queueing a job, driving its events
+//! and collecting reasoning, content and tool calls.
 
 use std::{
     convert::Infallible,

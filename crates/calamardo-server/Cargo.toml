@@ -1,6 +1,6 @@
 [package]
 name = "calamardo-server"
-description = "OpenAI-compatible HTTP server for Calamardo"
+description = "HTTP server for Calamardo: OpenAI, Anthropic and Ollama APIs"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

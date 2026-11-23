@@ -1,4 +1,5 @@
-//! OpenAI-compatible server for Inkling 2 Mini (milestone 4).
+//! HTTP server for Inkling 2 Mini: OpenAI, Anthropic and Ollama APIs over a
+//! single model slot, with a prefix cache in RAM and on disk.
 
 mod anthropic;
 pub mod disk;
