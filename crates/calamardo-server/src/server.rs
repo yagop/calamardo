@@ -195,40 +195,68 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         .route("/api/version", get(crate::ollama::version))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(cors)
+        .layer(axum::middleware::from_fn(access_log))
         .with_state(app.clone());
     let (queue_for_shutdown, app_for_shutdown) = (app.queue.clone(), app);
     eprintln!("listening on http://{addr}");
     let closing = queue_for_shutdown.clone();
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        // Refuse queued requests and stop the running one at once, so
+        // open connections finish quickly; a second signal exits now.
+        eprintln!(
+            "shutting down: {} (signal again to exit now)",
+            if keep_disk {
+                "saving conversations"
+            } else {
+                "deleting the cache"
+            }
+        );
+        closing.close();
+        tokio::spawn(async move {
             shutdown_signal().await;
-            // Refuse queued requests and stop the running one at once, so
-            // open connections finish quickly; a second signal exits now.
-            eprintln!(
-                "shutting down: {} (signal again to exit now)",
-                if keep_disk {
-                    "saving conversations"
-                } else {
-                    "deleting the cache"
-                }
-            );
-            closing.close();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                if !keep_disk {
-                    crate::disk::remove_owned();
-                }
-                eprintln!("exiting now");
-                std::process::exit(130);
-            });
-        })
-        .await?;
+            if !keep_disk {
+                crate::disk::remove_owned();
+            }
+            eprintln!("exiting now");
+            std::process::exit(130);
+        });
+    })
+    .await?;
     // Let the model thread finish and save its conversations to disk.
     queue_for_shutdown.close();
     while !app_for_shutdown.worker.is_finished() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(())
+}
+
+/// One line per HTTP request once its response starts: time, client,
+/// method, path, status and how long that took (for a stream, until it
+/// started). `/health` and `/metrics` are left out: monitors poll them.
+async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    // Present when served with connect info, as `serve` does.
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map_or_else(|| "-".to_string(), |c| c.0.ip().to_string());
+    let (method, path) = (req.method().clone(), req.uri().path().to_owned());
+    let began = std::time::Instant::now();
+    let res = next.run(req).await;
+    if !matches!(path.as_str(), "/health" | "/metrics") {
+        eprintln!(
+            "{} {} {method} {path} → {} in {:.2?}",
+            crate::report::clock(),
+            peer,
+            res.status().as_u16(),
+            began.elapsed()
+        );
+    }
+    res
 }
 
 /// Ctrl-C or SIGTERM.
@@ -344,6 +372,8 @@ struct Request {
     stop: Vec<String>,
     stream: bool,
     include_usage: bool,
+    /// For the log (`Asked::line`).
+    summary: String,
 }
 
 /// OpenAI messages into what the template expects: `developer` as `system`,
@@ -466,6 +496,98 @@ pub(crate) struct Gen {
     pub(crate) temperature: f32,
     pub(crate) top_p: f32,
     pub(crate) seed: u64,
+    /// What the request asked for, logged when it arrives (`Asked::line`).
+    pub(crate) summary: String,
+}
+
+/// What a generation request asked for, as the client sent it, for the log.
+pub(crate) struct Asked<'a> {
+    /// Which API, e.g. "chat completions".
+    pub(crate) api: &'a str,
+    pub(crate) model: &'a str,
+    /// Messages or input items; `None` for a raw prompt (no chat template).
+    pub(crate) messages: Option<usize>,
+    pub(crate) tools: usize,
+    /// The reasoning effort the request sent, if any.
+    pub(crate) effort: Option<&'a Value>,
+    /// What the request sent when it is not literally an effort (e.g. a
+    /// thinking budget), shown instead of "sent".
+    pub(crate) effort_note: Option<String>,
+    /// The output limit the request sent, if any.
+    pub(crate) max_tokens: Option<f64>,
+    /// What the request sent when it is not a usable limit (e.g. Ollama's
+    /// `num_predict: -1`).
+    pub(crate) max_note: Option<String>,
+    pub(crate) stream: bool,
+}
+
+/// A client string for the log: escaped (no line breaks or terminal codes)
+/// and at most 60 characters.
+fn loggable(s: &str) -> String {
+    let e: String = s.escape_debug().collect();
+    if e.chars().count() > 60 {
+        format!("{}…", e.chars().take(60).collect::<String>())
+    } else {
+        e
+    }
+}
+
+impl Asked<'_> {
+    /// One line: model, size, reasoning effort and output limit, and where
+    /// the effort and the limit came from (the request or the server).
+    pub(crate) fn line(&self, app: &App) -> String {
+        let shown = |v: &Value| loggable(&v.as_str().map_or_else(|| v.to_string(), String::from));
+        let mut parts = vec![format!("{} · model {}", self.api, loggable(self.model))];
+        match self.messages {
+            Some(n) => parts.push(format!(
+                "{n} message{}{}",
+                if n == 1 { "" } else { "s" },
+                if self.tools > 0 {
+                    format!(
+                        " · {} tool{}",
+                        self.tools,
+                        if self.tools == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
+            )),
+            None => parts.push("raw prompt (no chat template)".into()),
+        }
+        let effort_note = self.effort_note.as_deref();
+        if self.messages.is_some() {
+            parts.push(match (self.effort, &app.cfg.default_reasoning_effort) {
+                (Some(e), _) => {
+                    format!(
+                        "reasoning effort {} ({})",
+                        shown(e),
+                        effort_note.unwrap_or("sent")
+                    )
+                }
+                (None, Some(d)) => format!(
+                    "reasoning effort {d} (server default, {})",
+                    effort_note.unwrap_or("none sent")
+                ),
+                (None, None) => format!(
+                    "reasoning effort template default ({})",
+                    effort_note.unwrap_or("none sent")
+                ),
+            });
+        }
+        let max_note = self.max_note.as_deref();
+        parts.push(match self.max_tokens {
+            Some(n) => format!("max_tokens {n} ({})", max_note.unwrap_or("sent")),
+            None => format!(
+                "max_tokens {} (server default, {})",
+                app.cfg.default_max_tokens,
+                max_note.unwrap_or("none sent")
+            ),
+        });
+        if self.stream {
+            parts.push("stream".into());
+        }
+        parts.join(" · ")
+    }
 }
 
 /// Why a request did not get the model, for each API to report its way.
@@ -608,6 +730,7 @@ pub(crate) async fn drive(
 
 /// Queues the job and waits for the slot.
 pub(crate) async fn start(app: &App, job: &Gen) -> Result<Running, Refused> {
+    eprintln!("{} {}", crate::report::clock(), job.summary);
     if job.prompt.len() >= app.max_context {
         return Err(Refused::BadRequest(format!(
             "the prompt has {} tokens; the model's context holds {} with the reply",
@@ -678,33 +801,53 @@ fn parse_request(app: &App, body: &Value) -> Result<Request, String> {
         effort_or_default(app, effort).as_ref(),
     )?;
     let num = |k: &str| body.get(k).and_then(|v| v.as_f64());
-    let max_tokens = body
+    let sent_max = body
         .get("max_completion_tokens")
+        .filter(|v| !v.is_null())
         .or_else(|| body.get("max_tokens"))
-        .and_then(|v| v.as_f64())
-        .map_or(app.cfg.default_max_tokens, |v| v as usize);
+        .and_then(|v| v.as_f64());
+    let max_tokens = sent_max.map_or(app.cfg.default_max_tokens, |v| v as usize);
     let stop = stop_list(body.get("stop"));
     let seed = num("seed").map(|v| v as u64).unwrap_or_else(random_seed);
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&app.cfg.model_name)
+        .to_string();
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let summary = Asked {
+        api: "chat completions",
+        model: &model,
+        // As sent (the format instruction is ours).
+        messages: body["messages"].as_array().map(|m| m.len()),
+        tools: tools.and_then(|t| t.as_array()).map_or(0, |t| t.len()),
+        effort: body
+            .get("reasoning_effort")
+            .or_else(|| body.pointer("/reasoning/effort"))
+            .filter(|v| !v.is_null()),
+        effort_note: None,
+        max_tokens: sent_max,
+        max_note: None,
+        stream,
+    }
+    .line(app);
     Ok(Request {
-        model: body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&app.cfg.model_name)
-            .to_string(),
+        model,
         prompt,
         max_tokens: max_tokens.max(1),
         temperature: num("temperature").unwrap_or(1.0) as f32,
         top_p: num("top_p").unwrap_or(1.0) as f32,
         seed,
         stop,
-        stream: body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        stream,
         include_usage: body
             .pointer("/stream_options/include_usage")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        summary,
     })
 }
 
@@ -865,6 +1008,7 @@ async fn chat_completions(
             temperature: req.temperature,
             top_p: req.top_p,
             seed: req.seed,
+            summary: req.summary.clone(),
         };
         let run = start(&app, &job).await?;
         Ok::<_, Refused>((req, run))

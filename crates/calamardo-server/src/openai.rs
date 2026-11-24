@@ -24,7 +24,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::{
     parser::Delta,
     server::{
-        App, Collector, Gen, Item, Refused, blocking, chat_prompt, completion_id, drive,
+        App, Asked, Collector, Gen, Item, Refused, blocking, chat_prompt, completion_id, drive,
         effort_or_default, format_instruction, json_body, normalize_messages, now, precheck,
         random_seed, raw_prompt, start, stop_list,
     },
@@ -92,11 +92,28 @@ fn parse_completion(app: &App, body: &Value) -> Result<Completion, String> {
         prompt_text,
         job: Gen {
             prompt,
-            // OpenAI's default for this endpoint.
-            max_tokens: num(body, "max_tokens").map_or(16, |v| v as usize).max(1),
+            // The server's default, like every other API (OpenAI's is 16).
+            max_tokens: num(body, "max_tokens")
+                .map_or(app.cfg.default_max_tokens, |v| v as usize)
+                .max(1),
             temperature: num(body, "temperature").unwrap_or(1.0) as f32,
             top_p: num(body, "top_p").unwrap_or(1.0) as f32,
             seed: num(body, "seed").map_or_else(random_seed, |v| v as u64),
+            summary: Asked {
+                api: "completions",
+                model: body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&app.cfg.model_name),
+                messages: None,
+                tools: 0,
+                effort: None,
+                effort_note: None,
+                max_tokens: num(body, "max_tokens"),
+                max_note: None,
+                stream: body.get("stream").and_then(|v| v.as_bool()) == Some(true),
+            }
+            .line(app),
         },
         stop: stop_list(body.get("stop")),
         stream: body
@@ -424,6 +441,27 @@ fn parse_responses(app: &App, body: &Value) -> Result<ResponsesRequest, String> 
             temperature: num(body, "temperature").unwrap_or(1.0) as f32,
             top_p: num(body, "top_p").unwrap_or(1.0) as f32,
             seed: random_seed(),
+            summary: Asked {
+                api: "responses",
+                model: body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&app.cfg.model_name),
+                messages: Some(match body.get("input") {
+                    Some(Value::Array(items)) => items.len(),
+                    _ => 1,
+                }),
+                tools: tools
+                    .as_ref()
+                    .and_then(|t| t.as_array())
+                    .map_or(0, |t| t.len()),
+                effort: body.pointer("/reasoning/effort").filter(|v| !v.is_null()),
+                effort_note: None,
+                max_tokens: num(body, "max_output_tokens"),
+                max_note: None,
+                stream: body.get("stream").and_then(|v| v.as_bool()) == Some(true),
+            }
+            .line(app),
         },
         stream: body
             .get("stream")

@@ -19,7 +19,7 @@ use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use crate::{
     parser::Delta,
     server::{
-        App, Collector, Gen, Item, Refused, blocking, chat_prompt, drive, effort_or_default,
+        App, Asked, Collector, Gen, Item, Refused, blocking, chat_prompt, drive, effort_or_default,
         json_body, normalize_messages, precheck, random_seed, raw_prompt, start, stop_list,
     },
     worker::{Done, Finish},
@@ -113,18 +113,47 @@ fn chat_messages(body: &Value) -> Result<Vec<Value>, String> {
     normalize_messages(&Value::Array(out))
 }
 
-fn options(app: &App, body: &Value, prompt: Vec<u32>) -> (Gen, Vec<String>) {
+/// The job from `options`; `api`, `messages` and `tools` are for the log
+/// (`messages` is `None` for a raw prompt).
+fn options(
+    app: &App,
+    body: &Value,
+    prompt: Vec<u32>,
+    api: &str,
+    messages: Option<usize>,
+    tools: usize,
+) -> (Gen, Vec<String>) {
     let o = body.get("options").cloned().unwrap_or(json!({}));
     let num = |k: &str| o.get(k).and_then(|v| v.as_f64());
+    // -1 and -2 mean "no limit" in Ollama.
+    let sent_max = num("num_predict").filter(|&n| n > 0.0);
     let job = Gen {
         prompt,
-        // -1 and -2 mean "no limit" in Ollama.
-        max_tokens: num("num_predict")
-            .filter(|&n| n > 0.0)
-            .map_or(app.cfg.default_max_tokens, |n| n as usize),
+        max_tokens: sent_max.map_or(app.cfg.default_max_tokens, |n| n as usize),
         temperature: num("temperature").unwrap_or(1.0) as f32,
         top_p: num("top_p").unwrap_or(1.0) as f32,
         seed: num("seed").map_or_else(random_seed, |v| v as u64),
+        summary: Asked {
+            api,
+            model: body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&app.cfg.model_name),
+            messages,
+            tools,
+            effort: think_effort(body).as_ref(),
+            effort_note: match body.get("think") {
+                Some(Value::Bool(b)) => Some(format!("think {b} sent")),
+                Some(Value::String(_)) => Some("sent as think".into()),
+                _ => None,
+            },
+            max_tokens: sent_max,
+            max_note: num("num_predict")
+                .filter(|&n| n <= 0.0)
+                .map(|n| format!("num_predict {n} sent")),
+            stream: body.get("stream").and_then(|v| v.as_bool()) != Some(false),
+        }
+        .line(app),
     };
     (job, stop_list(o.get("stop")))
 }
@@ -164,7 +193,14 @@ fn parse_chat(app: &App, body: &Value) -> Result<Option<OllamaRequest>, String> 
         tools,
         effort_or_default(app, think_effort(body)).as_ref(),
     )?;
-    let (job, stop) = options(app, body, prompt);
+    let (job, stop) = options(
+        app,
+        body,
+        prompt,
+        "ollama chat",
+        body["messages"].as_array().map(|m| m.len()),
+        tools.and_then(|t| t.as_array()).map_or(0, |t| t.len()),
+    );
     Ok(Some(OllamaRequest {
         model: model_name(app, body),
         job,
@@ -209,7 +245,7 @@ fn parse_generate(app: &App, body: &Value) -> Result<Option<OllamaRequest>, Stri
             effort_or_default(app, think_effort(body)).as_ref(),
         )?
     };
-    let (job, stop) = options(app, body, prompt);
+    let (job, stop) = options(app, body, prompt, "ollama generate", (!raw).then_some(1), 0);
     Ok(Some(OllamaRequest {
         model: model_name(app, body),
         job,

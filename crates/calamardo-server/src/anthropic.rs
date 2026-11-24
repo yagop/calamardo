@@ -23,7 +23,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::{
     parser::Delta,
     server::{
-        App, Collector, Gen, Item, Refused, blocking, chat_prompt, completion_id, drive,
+        App, Asked, Collector, Gen, Item, Refused, blocking, chat_prompt, completion_id, drive,
         effort_or_default, json_body, normalize_messages, precheck, random_seed, raw_prompt,
         stop_list,
     },
@@ -228,6 +228,23 @@ fn thinking_effort(body: &Value) -> Option<Value> {
     }
 }
 
+/// How `thinking` became the effort, for the log.
+fn thinking_note(body: &Value) -> Option<String> {
+    let t = body.get("thinking")?;
+    match t.get("type").and_then(|v| v.as_str()) {
+        Some("enabled") => Some(format!(
+            "from thinking budget {}",
+            t.get("budget_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+        )),
+        Some("disabled") => Some("from thinking disabled".into()),
+        Some(other) => Some(format!(
+            "thinking type {:?} sent",
+            other.chars().take(30).collect::<String>()
+        )),
+        None => None,
+    }
+}
+
 struct MessagesRequest {
     model: String,
     job: Gen,
@@ -259,6 +276,24 @@ fn parse_messages(app: &App, body: &Value) -> Result<MessagesRequest, String> {
             temperature: num("temperature").unwrap_or(1.0) as f32,
             top_p: num("top_p").unwrap_or(1.0) as f32,
             seed: random_seed(),
+            summary: Asked {
+                api: "messages",
+                model: body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&app.cfg.model_name),
+                messages: body["messages"].as_array().map(|m| m.len()),
+                tools: tools
+                    .as_ref()
+                    .and_then(|t| t.as_array())
+                    .map_or(0, |t| t.len()),
+                effort: thinking_effort(body).as_ref(),
+                effort_note: thinking_note(body),
+                max_tokens: num("max_tokens"),
+                max_note: None,
+                stream: body.get("stream").and_then(|v| v.as_bool()) == Some(true),
+            }
+            .line(app),
         },
         stop: stop_list(body.get("stop_sequences")),
         stream: body

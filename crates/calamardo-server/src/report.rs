@@ -1,6 +1,7 @@
-//! What the server prints when it starts: configuration and environment.
+//! What the server prints: configuration and environment at startup, and
+//! the local time that prefixes request log lines.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_int, c_long, c_void};
 
 use crate::server::ServerConfig;
 
@@ -12,6 +13,39 @@ unsafe extern "C" {
         newp: *mut c_void,
         newlen: usize,
     ) -> i32;
+    fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+}
+
+/// `struct tm` as macOS lays it out.
+#[repr(C)]
+struct Tm {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long,
+    zone: *const c_char,
+}
+
+/// Local time as `HH:MM:SS`, for log lines.
+pub(crate) fn clock() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    // SAFETY: both pointers are valid for the call; localtime_r fills `tm`
+    // and returns null only on failure.
+    if unsafe { localtime_r(&now, tm.as_mut_ptr()) }.is_null() {
+        return "--:--:--".into();
+    }
+    // SAFETY: initialized by the successful call above.
+    let tm = unsafe { tm.assume_init() };
+    format!("{:02}:{:02}:{:02}", tm.hour, tm.min, tm.sec)
 }
 
 /// A sysctl string value (empty if missing).
